@@ -20,6 +20,7 @@ are returned with the correct basis and a ``null`` value, ready for later steps.
 
 from __future__ import annotations
 
+import datetime as _dt
 from dataclasses import asdict, dataclass, field
 from collections import Counter
 
@@ -304,6 +305,146 @@ def _macros_links(wx: WorkbookXray) -> Field:
     return Field.extracted(parts or ["none detected"])
 
 
+# ------------------------------------------------- AI findings (Step 3)
+
+_RECON_KEYWORDS = (
+    "recon", "variance", "diff", "difference", "tolerance", "exception",
+    "ageing", "aging", "aged", "unmatched", "tie-out", "tie out", "balance",
+)
+_SUPERSEDED_NAMES = (
+    "old", "backup", "copy", " v1", "v1.", "draft", "archive", "tmp", "temp", "bak",
+)
+
+
+def _months_since(iso: str | None) -> int | None:
+    """Whole months between an ISO timestamp and now; None if unparseable."""
+    if not iso:
+        return None
+    try:
+        s = str(iso).replace("Z", "+00:00")
+        when = _dt.datetime.fromisoformat(s)
+        if when.tzinfo is not None:
+            when = when.replace(tzinfo=None)
+    except (ValueError, TypeError):
+        return None
+    days = (_dt.datetime.now() - when).days
+    return max(0, days // 30)
+
+
+def _recon_signals(wx: WorkbookXray, t: dict) -> list[str]:
+    """Shared reconciliation-pattern detection, reused by two fields."""
+    fns = t["functions"]
+    signals: list[str] = []
+    matching = sum(fns.get(f, 0) for f in ("VLOOKUP", "HLOOKUP", "XLOOKUP", "MATCH", "INDEX"))
+    if matching:
+        signals.append(f"matching via {matching} lookup/match call(s)")
+    if fns.get("ABS"):
+        signals.append(f"{fns['ABS']} ABS() call(s) — variance/tolerance comparison")
+
+    skeletons = [sk for s in wx.sheets for sk, _ in s.formula_profile.get("top_skeletons", [])]
+    tol = [sk for sk in skeletons if ("<" in sk or ">" in sk) and "N" in sk and "IF" in sk.upper()]
+    if tol:
+        signals.append(f"tolerance/threshold test, e.g. {tol[0]}")
+
+    headers = [h.lower() for s in wx.sheets for r in s.regions for h in r.headers if h]
+    kw = sorted({k for h in headers for k in _RECON_KEYWORDS if k in h})
+    if kw:
+        signals.append("reconciliation-labelled header(s): " + ", ".join(kw))
+    return signals
+
+
+def _reconciliation_logic(wx: WorkbookXray, t: dict) -> Field:
+    signals = _recon_signals(wx, t)
+    if not signals:
+        return Field.derived(
+            "No reconciliation pattern detected", 0.5,
+            ["no lookup/variance/tolerance logic or reconciliation-labelled headers"],
+        )
+    return Field.derived({"matching_and_checks": signals}, 0.6,
+                         ["heuristic from functions, formula shapes and headers"])
+
+
+def _simplification(wx: WorkbookXray, t: dict) -> Field:
+    ops: list[str] = []
+    if t["hardcoded"] > 5:
+        ops.append(f"{t['hardcoded']} hardcoded numbers buried in formulas — lift to a "
+                   "named inputs/assumptions block")
+    if t["formulas"] > 50 and t["distinct"]:
+        comp = t["formulas"] / t["distinct"]
+        if comp < 3:
+            ops.append(f"low formula reuse ({comp:.1f} per distinct shape) — many "
+                       "one-off formulas to standardise")
+    if t["volatile"]:
+        ops.append(f"{t['volatile']} volatile function(s) (OFFSET/INDIRECT/…) — replace "
+                   "with structured references/tables")
+    hidden = [s.name for s in wx.sheets if s.state != "visible"]
+    if hidden:
+        ops.append(f"hidden sheet(s) {hidden} — remove if obsolete")
+    errors = sum(len(s.error_cells) for s in wx.sheets)
+    if errors:
+        ops.append(f"{errors} cached error cell(s) — fix or remove broken logic")
+    if len(wx.sheets) > 15:
+        ops.append(f"{len(wx.sheets)} sheets — consider consolidating tabs")
+
+    verdict = "Yes" if len(ops) >= 2 else "Possibly" if ops else "No"
+    conf = 0.55 + 0.1 * min(3, len(ops))
+    return Field.derived(
+        {"verdict": verdict, "opportunities": ops or ["no obvious simplification signals"]},
+        min(conf, 0.85), [f"{len(ops)} simplification signal(s)"],
+    )
+
+
+def _automation(wx: WorkbookXray, t: dict) -> Field:
+    drivers: list[str] = []
+    against: list[str] = []
+
+    manual_ratio = t["non_formula_cells"] / max(1, t["cells"])
+    if manual_ratio > 0.5:
+        drivers.append(f"{manual_ratio:.0%} of cells manually entered — repetitive manual effort")
+    comp = t["formulas"] / t["distinct"] if t["distinct"] else 0
+    if comp >= 5:
+        drivers.append(f"systematic formulas ({comp:.0f}x reuse) — rules are regular and codifiable")
+    elif 0 < comp < 2:
+        against.append("many bespoke one-off formulas — logic is not uniform")
+    if wx.connections or wx.external_links:
+        drivers.append("existing data connections/links — source is already systemised")
+    if _recon_signals(wx, t):
+        drivers.append("reconciliation/lookup logic — a classic automation target")
+    if wx.has_vba:
+        drivers.append("already partly automated via VBA/macros")
+
+    verdict = "Yes" if len(drivers) >= 2 else "Possibly" if drivers else "Unlikely"
+    conf = 0.55 + 0.1 * min(3, len(drivers))
+    return Field.derived(
+        {"verdict": verdict, "drivers": drivers or ["no strong automation drivers"],
+         "against": against},
+        min(conf, 0.85), [f"{len(drivers)} driver(s), {len(against)} counter-signal(s)"],
+    )
+
+
+def _retirement(wx: WorkbookXray) -> Field:
+    signals: list[str] = []
+    months = _months_since((wx.core_props or {}).get("modified") or wx.fs_modified)
+    if months is not None and months > 12:
+        signals.append(f"not modified in ~{months} months (stale)")
+    name = wx.filename.lower()
+    if any(k in name for k in _SUPERSEDED_NAMES):
+        signals.append("filename suggests a superseded/backup copy")
+    hidden = [s.name for s in wx.sheets if s.state != "visible"]
+    if wx.sheets and len(hidden) >= len(wx.sheets) / 2:
+        signals.append(f"{len(hidden)}/{len(wx.sheets)} sheets hidden — possibly disused")
+    errors = sum(len(s.error_cells) for s in wx.sheets)
+    if errors and errors >= max(3, 0.02 * max(1, sum(s.populated_cells for s in wx.sheets))):
+        signals.append(f"{errors} cached error cell(s) — logic may be broken/abandoned")
+
+    if signals:
+        return Field.derived({"verdict": "Review for retirement", "signals": signals},
+                             0.5, ["heuristic; confirm against business usage"])
+    return Field(value={"verdict": "No automated retirement signal"}, basis="needs_human",
+                 evidence=["retirement depends on business usage/recurrence, not "
+                           "knowable from the file alone"])
+
+
 # ------------------------------------------------------------------- entry
 
 
@@ -329,21 +470,20 @@ def assess_file(wx: WorkbookXray) -> FileAssessment:
     fa.completion_timeline = Field.pending("needs_human", "not knowable from the file")
     fa.output_recipient = Field.pending("needs_human", "downstream consumer is external context")
 
-    # Key AI Finding / Observation — later steps
+    # Key AI Finding / Observation — heuristic (Step 3); corpus ones deferred
     fa.potential_duplication = Field.pending("needs_corpus", "needs the folder of workbooks")
     fa.similar_duplicate_files = Field.pending("needs_corpus", "needs the folder of workbooks")
     fa.potential_consolidation = Field.pending("needs_corpus", "needs the folder of workbooks")
-    fa.potential_simplification = Field.pending("needs_llm", "heuristic + judgement (Step 3)")
-    fa.potential_automation = Field.pending("needs_llm", "heuristic + judgement (Step 3)")
-    fa.potential_retirement = Field.pending("needs_llm", "heuristic + judgement (Step 3)")
+    fa.potential_simplification = _simplification(wx, t)
+    fa.potential_automation = _automation(wx, t)
+    fa.potential_retirement = _retirement(wx)
 
     # Workbook logic / Automation — extracted / derived
     fa.logic_type = _logic_type(wx, t)
     fa.key_calculations_logic = _key_calculations(wx, t)
     fa.manual_intervention = _manual_intervention(wx, t)
     fa.macros_vba_external_links = _macros_links(wx)
-    fa.reconciliation_logic = Field.pending(
-        "needs_llm", "matching criteria/tolerances/ageing (Step 3 heuristic)")
+    fa.reconciliation_logic = _reconciliation_logic(wx, t)
 
     return fa
 

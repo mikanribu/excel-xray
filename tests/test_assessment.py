@@ -103,3 +103,53 @@ def test_calc_needs_validation_for_error_and_hardcodes(xray):
 def test_downstream_cross_file_left_to_corpus(xray):
     t = _tab(xray, "Calc")
     assert t.downstream_dependencies.value["other_files"] is None
+
+
+# ------------------------------------------------- AI findings (Step 3)
+
+
+def test_simplification_flags_hardcodes_and_hidden_sheet(xray):
+    fa = assess(xray).file
+    sf = fa.potential_simplification
+    assert sf.basis == "derived"
+    assert sf.value["verdict"] == "Yes"
+    ops = " ".join(sf.value["opportunities"])
+    assert "hardcoded" in ops and "hidden" in ops
+
+
+def test_automation_is_a_candidate(xray):
+    fa = assess(xray).file
+    au = fa.potential_automation
+    assert au.basis == "derived"
+    assert au.value["verdict"] in {"Yes", "Possibly"}
+    assert au.value["drivers"]
+
+
+def test_retirement_defers_when_no_signal(xray):
+    # A freshly written fixture with no backup-naming has no retirement signal.
+    fa = assess(xray).file
+    rt = fa.potential_retirement
+    assert rt.basis in {"derived", "needs_human"}
+    if rt.basis == "needs_human":
+        assert rt.value["verdict"] == "No automated retirement signal"
+
+
+def test_reconciliation_absent_on_calc_model(xray):
+    fa = assess(xray).file
+    rl = fa.reconciliation_logic
+    assert rl.basis == "derived"
+    assert rl.value == "No reconciliation pattern detected"
+
+
+def test_corpus_findings_still_deferred(xray):
+    fa = assess(xray).file
+    assert fa.potential_duplication.basis == "needs_corpus"
+    assert fa.potential_consolidation.basis == "needs_corpus"
+
+
+def test_months_since_helper():
+    from excel_xray.assessment import _months_since
+    assert _months_since(None) is None
+    assert _months_since("not-a-date") is None
+    assert _months_since("2020-01-01T00:00:00") >= 12
+    assert _months_since("2020-01-01T00:00:00Z") >= 12  # tz-aware parses too
