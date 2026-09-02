@@ -1,0 +1,32 @@
+[project]
+name = "excel-xray"
+version = "0.1.0"
+description = "Extract structure, formulas and inputs from complicated Excel files and explain what they do."
+readme = "README.md"
+authors = [
+    { name = "mikanribu", email = "clementine.pages@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "lxml>=6.1.2",
+]
+
+[project.scripts]
+excel-xray = "excel_xray:main"
+
+[project.optional-dependencies]
+encrypted = [
+    "olefile>=0.47",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[build-system]
+requires = ["uv_build>=0.11.28,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
