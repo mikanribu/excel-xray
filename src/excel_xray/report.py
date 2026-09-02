@@ -11,6 +11,17 @@ import json
 from dataclasses import asdict
 
 from .scan import WorkbookXray
+from .tabular import FILE_FIELDS, TAB_FIELDS, file_rows, tab_rows
+
+BASIS_COLOR = {
+    "extracted": "#167B75",
+    "derived": "#2D6CA2",
+    "drafted": "#B4531F",
+    "inferred": "#6B4E9E",
+    "needs_llm": "#7A8290",
+    "needs_human": "#7A8290",
+    "needs_corpus": "#7A8290",
+}
 
 KIND_COLOR = {
     "data_table": "#2D6CA2",
@@ -93,6 +104,28 @@ table.sk td.f{font-family:ui-monospace,monospace;word-break:break-all}
 .legend span{display:flex;align-items:center;gap:6px}
 footer{margin-top:34px;padding-top:16px;border-top:1px solid var(--rule);
   font-size:12.5px;color:var(--dim)}
+.assess{background:var(--panel);border:1px solid var(--rule);border-radius:4px;
+  margin:20px 0;padding:6px 16px 16px}
+.assess>h2{font-size:16px;font-weight:600;margin:12px 2px 6px}
+.assess>h3{font:600 11px/1 ui-monospace,monospace;letter-spacing:.14em;
+  text-transform:uppercase;color:var(--dim);margin:18px 2px 8px}
+.scroll{overflow-x:auto}
+table.euc{width:100%;border-collapse:collapse;font-size:12.5px}
+table.euc th{text-align:left;font:600 10px/1.3 ui-monospace,monospace;
+  letter-spacing:.08em;text-transform:uppercase;color:var(--dim);
+  padding:7px 9px;border-bottom:1px solid var(--rule);vertical-align:bottom}
+table.euc td{padding:6px 9px;border-bottom:1px solid #EEF1F5;vertical-align:top}
+td.grp{font:600 10px/1.3 ui-monospace,monospace;letter-spacing:.06em;
+  text-transform:uppercase;color:var(--dim);white-space:nowrap}
+td.fld{font-weight:600;white-space:nowrap;color:var(--ink)}
+table.matrix td:first-child{font-weight:600;white-space:nowrap}
+table.matrix td{max-width:230px}
+.cellv{display:block;max-height:3.4em;overflow:hidden;text-overflow:ellipsis}
+.badge{display:inline-block;font:600 9px/1.4 ui-monospace,monospace;
+  letter-spacing:.04em;padding:1px 5px;border-radius:2px;color:#fff;
+  white-space:nowrap;vertical-align:middle}
+.legend2{margin:10px 2px 0;font-size:11.5px;color:var(--dim);
+  display:flex;flex-wrap:wrap;gap:12px}
 """
 
 JS = """
@@ -135,7 +168,61 @@ def _esc(s) -> str:
     return html.escape(str(s if s is not None else ""))
 
 
-def build_report(wx: WorkbookXray) -> str:
+def _badge(basis: str) -> str:
+    return (f"<span class='badge' style='background:{BASIS_COLOR.get(basis, '#888')}'>"
+            f"{_esc(basis)}</span>")
+
+
+def _render_assessment(assessment) -> str:
+    """Render the EUC assessment as the File level / Tab level review tables."""
+    parts: list[str] = []
+    A = parts.append
+    A("<section class='assess'><h2>EUC assessment</h2>")
+
+    # ---- File level summary (Type | Field | Value | Basis) --------------
+    A("<h3>File level summary</h3><table class='euc'>"
+      "<tr><th>Type</th><th>Field</th><th>Value</th><th>Basis</th></tr>")
+    prev = None
+    for r in file_rows(assessment):
+        grp = "" if r["type"] == prev else r["type"]
+        prev = r["type"]
+        A(f"<tr><td class='grp'>{_esc(grp)}</td>"
+          f"<td class='fld'>{_esc(r['field'])}</td>"
+          f"<td><span class='cellv' title='{_esc(r['evidence'])}'>{_esc(r['value'])}</span></td>"
+          f"<td>{_badge(r['basis'])}</td></tr>")
+    A("</table>")
+
+    # ---- Tab level details (matrix: rows = tabs, cols = fields) ----------
+    if assessment.tabs:
+        labels = [label for _sec, _attr, label in TAB_FIELDS]
+        rows = tab_rows(assessment)
+        by_tab: dict[str, dict] = {}
+        for r in rows:
+            by_tab.setdefault(r["tab"], {})[r["field"]] = r
+        A("<h3>Tab level details</h3><div class='scroll'><table class='euc matrix'><tr>"
+          + "".join(f"<th>{_esc(l)}</th>" for l in labels) + "</tr>")
+        for tab, fields in by_tab.items():
+            A("<tr>")
+            for label in labels:
+                cell = fields.get(label, {"value": "—", "basis": "", "evidence": ""})
+                badge = _badge(cell["basis"]) if cell["basis"] in (
+                    "drafted", "inferred") else ""
+                A(f"<td><span class='cellv' title='{_esc(cell['evidence'])}'>"
+                  f"{_esc(cell['value'])}</span> {badge}</td>")
+            A("</tr>")
+        A("</table></div>")
+
+    A("<div class='legend2'>"
+      "<span>extracted = read from the file</span>"
+      "<span>derived = heuristic over evidence</span>"
+      "<span>drafted = offline narrative template</span>"
+      "<span>inferred = model-written</span>"
+      "<span>needs_* = pending model / human / corpus</span></div>")
+    A("</section>")
+    return "".join(parts)
+
+
+def build_report(wx: WorkbookXray, assessment=None) -> str:
     total_regions = sum(len(s.regions) for s in wx.sheets)
     total_formulas = sum(s.formula_profile.get("total", 0) for s in wx.sheets)
     distinct = sum(s.formula_profile.get("distinct_skeletons", 0) for s in wx.sheets)
@@ -179,6 +266,9 @@ def build_report(wx: WorkbookXray) -> str:
         A(f"<div class='warn'>Hidden sheet(s): <span class='mono'>"
           f"{_esc(', '.join(hidden))}</span>. Hidden sheets often hold the working "
           f"logic a report depends on &mdash; check before consolidating.</div>")
+
+    if assessment is not None:
+        A(_render_assessment(assessment))
 
     for s in wx.sheets:
         fp = s.formula_profile
@@ -256,7 +346,7 @@ def build_report(wx: WorkbookXray) -> str:
     return "".join(parts)
 
 
-def write_report(wx: WorkbookXray, path: str) -> str:
+def write_report(wx: WorkbookXray, path: str, assessment=None) -> str:
     with open(path, "w", encoding="utf-8") as fh:
-        fh.write(build_report(wx))
+        fh.write(build_report(wx, assessment))
     return path

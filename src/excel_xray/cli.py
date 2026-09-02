@@ -54,6 +54,8 @@ def main() -> int:
                          "(needs the 'anthropic' package + a credential)")
     ap.add_argument("--model", default="claude-opus-5",
                     help="model id for --llm (default: claude-opus-5)")
+    ap.add_argument("--csv", default=None, metavar="PATH",
+                    help="also write the EUC assessment as a CSV table")
     ap.add_argument("--max-rows", type=int, default=200_000)
     args = ap.parse_args()
 
@@ -68,9 +70,8 @@ def main() -> int:
 
     ok = partial = failed = 0
     reasons: dict[str, list[str]] = {}
-    assess_batch: list = []  # collected for corpus-aware assessment
+    batch: list = []  # (path, wx) for assessment-aware output modes
     for p in paths:
-        t0 = time.time()
         try:
             wx = xray_workbook(p, max_rows=args.max_rows)
         except UnreadableWorkbook as e:
@@ -87,41 +88,49 @@ def main() -> int:
                 traceback.print_exc()
             continue
 
-        if args.assess:
-            # Defer: duplication/consolidation need the whole set at once.
-            assess_batch.append(wx)
-            ok += wx.parse_status == "full"
-            partial += wx.parse_status == "partial"
-            continue
-        if args.json:
+        ok += wx.parse_status == "full"
+        partial += wx.parse_status == "partial"
+        if args.json:  # raw scan, no assessment
             print(to_json(wx))
         else:
+            batch.append((p, wx))
+
+    # Assessment-aware modes (HTML report, --assess, --csv). One corpus pass so
+    # duplication/consolidation see the whole set.
+    assessments = None
+    if batch and (args.assess or args.csv or not args.json):
+        assessor = None
+        if args.llm:
+            from .narrative import ClaudeAssessor
+            assessor = ClaudeAssessor(model=args.model)
+        wxs = [wx for _, wx in batch]
+        if len(wxs) > 1:
+            from .corpus import assess_corpus
+            assessments = assess_corpus(wxs, assessor)
+        else:
+            assessments = [assess(wxs[0], assessor)]
+
+    if args.assess and assessments is not None:
+        payload = [assessment_to_dict(a) for a in assessments]
+        print(json.dumps(payload if len(payload) != 1 else payload[0],
+                         indent=2, default=str))
+    elif not args.json and assessments is not None:
+        for (p, wx), a in zip(batch, assessments):
             name = os.path.splitext(os.path.basename(p))[0]
             dest = os.path.join(outdir, f"xray_{name}.html")
-            write_report(wx, dest)
+            write_report(wx, dest, a)
             regions = sum(len(s.regions) for s in wx.sheets)
             low = sum(1 for s in wx.sheets for r in s.regions
                       if r.detect_confidence < 0.70)
             print(f"{wx.parse_status:8} {os.path.basename(p):46} "
                   f"{len(wx.sheets):3} sheets  {regions:3} regions  "
-                  f"{low:2} low-conf  {time.time()-t0:5.1f}s  -> {dest}")
-        ok += wx.parse_status == "full"
-        partial += wx.parse_status == "partial"
+                  f"{low:2} low-conf  -> {dest}")
 
-    if args.assess and assess_batch:
-        assessor = None
-        if args.llm:
-            from .narrative import ClaudeAssessor
-            assessor = ClaudeAssessor(model=args.model)
-        if len(assess_batch) > 1:
-            from .corpus import assess_corpus
-            results = assess_corpus(assess_batch, assessor)
-            payload = [assessment_to_dict(r) for r in results]
-        else:
-            # A single file cannot support duplication/consolidation findings;
-            # those stay needs_corpus.
-            payload = assessment_to_dict(assess(assess_batch[0], assessor))
-        print(json.dumps(payload, indent=2, default=str))
+    if args.csv and assessments is not None:
+        from .tabular import to_csv
+        named = [(wx.filename, a) for (_, wx), a in zip(batch, assessments)]
+        to_csv(named, args.csv)
+        print(f"wrote {args.csv} ({len(named)} workbook(s))", file=sys.stderr)
 
     total = len(paths)
     print(f"\ncoverage: {ok}/{total} full, {partial} partial, {failed} unreadable",
