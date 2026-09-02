@@ -348,9 +348,222 @@ def assess_file(wx: WorkbookXray) -> FileAssessment:
     return fa
 
 
+# ------------------------------------------------------- tab-level (Step 2)
+
+# Tabs whose best category scores below this are left "Uncertain" for the model,
+# rather than forced into a bucket.
+_CATEGORY_MIN_CONF = 0.55
+
+_LOOKUP_FNS = ("VLOOKUP", "HLOOKUP", "XLOOKUP", "MATCH", "INDEX", "LOOKUP")
+_COND_FNS = ("IF", "IFS", "IFERROR", "IFNA")
+
+
+def _sheet_ratio(s) -> float:
+    return s.formula_profile.get("total", 0) / max(1, s.populated_cells)
+
+
+def _dependency_maps(wx: WorkbookXray) -> tuple[dict, dict]:
+    """Return (reads, read_by) over in-workbook cross-sheet references.
+
+    ``reads[name]``   = set of sheets whose cells this tab's formulas reference.
+    ``read_by[name]`` = set of sheets that reference this tab (its downstream).
+    """
+    names = {s.name for s in wx.sheets}
+    reads: dict[str, set] = {}
+    read_by: dict[str, set] = {n: set() for n in names}
+    for s in wx.sheets:
+        refs = {
+            r for r in s.formula_profile.get("referenced_sheets", {})
+            if r in names and r != s.name
+        }
+        reads[s.name] = refs
+        for r in refs:
+            read_by.setdefault(r, set()).add(s.name)
+    return reads, read_by
+
+
+def _tab_category(s, wx, has_downstream: bool) -> Field:
+    """Auto-map to Input / Calculation / Mapping / Control Check / Validation /
+    Output, flagging low-confidence tabs as Uncertain (needs_llm)."""
+    name = s.name.lower()
+    fp = s.formula_profile
+    total_f = fp.get("total", 0)
+    ratio = _sheet_ratio(s)
+    fns = dict(fp.get("top_functions", []))
+    lookup = sum(fns.get(f, 0) for f in _LOOKUP_FNS)
+    cond = sum(fns.get(f, 0) for f in _COND_FNS)
+    kinds = [r.kind for r in s.regions]
+    scores: Counter = Counter()
+    ev: list[str] = []
+
+    def hint(*words) -> bool:
+        return any(w in name for w in words)
+
+    # Output
+    if hint("output", "report", "summary", "mi ", "mi_", "pack", "dashboard", "result"):
+        scores["Output"] += 2; ev.append("name suggests output/reporting")
+    if total_f and not has_downstream:
+        scores["Output"] += 1; ev.append("terminal tab (not referenced by other tabs)")
+    if wx.pivot_cache_sources:
+        scores["Output"] += 0.5
+
+    # Input
+    if hint("input", "data", "raw", "extract", "source", "feed", "import"):
+        scores["Input"] += 2; ev.append("name suggests input/data")
+    if ratio < 0.1 and s.populated_cells > 10:
+        scores["Input"] += 1.5; ev.append(f"low formula ratio {ratio:.0%} — mostly stored data")
+        if has_downstream:
+            scores["Input"] += 1; ev.append("read by other tabs — feeds the model")
+
+    # Calculation
+    if hint("calc", "working", "model", "engine", "compute"):
+        scores["Calculation"] += 2; ev.append("name suggests calculation/working")
+    if "calculation" in kinds:
+        scores["Calculation"] += 2; ev.append("calculation region detected")
+    if ratio > 0.4:
+        scores["Calculation"] += 1.5; ev.append(f"high formula ratio {ratio:.0%}")
+
+    # Mapping
+    if hint("map", "lookup", "reference", "xref", "lob", "code"):
+        scores["Mapping"] += 2; ev.append("name suggests mapping/lookup table")
+    if total_f and lookup >= total_f * 0.3:
+        scores["Mapping"] += 1.5; ev.append(f"{lookup} lookup/match call(s)")
+
+    # Control Check (automated tie-out) vs Validation (manual review)
+    if hint("check", "control", "tie", "recon", "reconcil", "proof", "agree"):
+        scores["Control Check"] += 2.5; ev.append("name suggests a control/reconciliation check")
+    if total_f and cond >= total_f * 0.4:
+        scores["Control Check"] += 1; ev.append("comparison/conditional-heavy")
+    if s.error_cells:
+        scores["Control Check"] += 0.5; ev.append(f"{len(s.error_cells)} cached error cell(s)")
+    if hint("valid", "review", "qa", "signoff", "sign-off", "approv"):
+        scores["Validation"] += 2.5; ev.append("name suggests validation/review")
+
+    if not scores:
+        return Field(value="Uncertain", basis="needs_llm", confidence=0.3,
+                     evidence=ev + ["no strong category signal — defer to model"])
+    top, sc = scores.most_common(1)[0]
+    conf = 0.4 + 0.5 * (sc / sum(scores.values()))
+    ranked = ", ".join(f"{k}={v:.1f}" for k, v in scores.most_common())
+    ev.append(f"scores: {ranked}")
+    if conf < _CATEGORY_MIN_CONF:
+        return Field(value="Uncertain", basis="needs_llm", confidence=round(conf, 2),
+                     evidence=ev + [f"top category below {_CATEGORY_MIN_CONF} confidence"])
+    return Field.derived(top, conf, ev)
+
+
+def _tab_information(s, has_upstream: bool, has_downstream: bool) -> Field:
+    """data input / intermediate workings / output / supporting."""
+    ratio = _sheet_ratio(s)
+    kinds = {r.kind for r in s.regions}
+    if s.populated_cells and ratio < 0.1:
+        val = "data input" if has_downstream else "supporting"
+    elif has_downstream and (has_upstream or ratio > 0.2):
+        val = "intermediate workings"
+    elif ratio > 0.1 and not has_downstream:
+        val = "output"
+    elif kinds <= {"notes", "title", "key_value", "unknown"}:
+        val = "supporting"
+    else:
+        val = "intermediate workings"
+    ev = [f"formula ratio {ratio:.0%}",
+          f"upstream={'yes' if has_upstream else 'no'}, "
+          f"downstream={'yes' if has_downstream else 'no'}"]
+    return Field.derived(val, 0.6, ev)
+
+
+def _tab_key_calc(s) -> Field:
+    fp = s.formula_profile
+    if not fp.get("total"):
+        return Field.extracted([], ["tab has no formulas"])
+    shapes = [f"{sk}  (×{n})" for sk, n in fp.get("top_skeletons", [])[:6]]
+    fns = [f"{fn}×{n}" for fn, n in fp.get("top_functions", [])[:8]]
+    return Field.extracted(
+        {"top_functions": fns, "top_formula_shapes": shapes},
+        [f"{fp['total']} formulas, {fp.get('distinct_skeletons', 0)} distinct shapes"],
+    )
+
+
+def _tab_upstream(s, wx, reads_set: set) -> Field:
+    deps: list[str] = []
+    deps += [f"sheet: {r}" for r in sorted(reads_set)]
+    if s.formula_profile.get("external_count", 0):
+        deps += [f"external workbook: {x}" for x in wx.external_links] or \
+                ["external workbook link(s)"]
+    fns = dict(s.formula_profile.get("top_functions", []))
+    if any(fns.get(f) for f in _LOOKUP_FNS):
+        deps.append("lookup tables (VLOOKUP/INDEX/MATCH targets)")
+    return Field.extracted(deps or ["none — self-contained tab"])
+
+
+def _tab_downstream(s, read_by_set: set) -> Field:
+    in_wb = [f"sheet: {r}" for r in sorted(read_by_set)]
+    return Field(
+        value={"in_workbook": in_wb or ["none within this workbook"],
+               "other_files": None},
+        basis="derived" if in_wb else "extracted",
+        confidence=1.0,
+        evidence=["in-workbook edges are exact; cross-file consumers need the "
+                  "corpus (needs_corpus)"],
+    )
+
+
+def _human_validation(s, wx) -> tuple[Field, Field]:
+    reasons: list[str] = []
+    fp = s.formula_profile
+    if s.error_cells:
+        reasons.append(f"{len(s.error_cells)} cached error cell(s): "
+                       + ", ".join(s.error_cells[:3]))
+    if fp.get("hardcoded_literal_count"):
+        reasons.append(f"{fp['hardcoded_literal_count']} formula(s) with a hardcoded "
+                       "number (buried assumption)")
+    if fp.get("volatile_count"):
+        reasons.append(f"{fp['volatile_count']} volatile function(s) — result depends "
+                       "on recalculation state")
+    if fp.get("external_count"):
+        reasons.append("references external workbook(s) — values not verifiable here")
+    low_conf = [r.ref for r in s.regions if r.detect_confidence < 0.70]
+    if low_conf:
+        reasons.append(f"ambiguous region layout at {', '.join(low_conf)}")
+    if wx.has_vba:
+        reasons.append("workbook contains VBA — logic may be hidden from the grid")
+
+    required = bool(reasons)
+    yn = Field.derived("Y" if required else "N", 0.7 if required else 0.55,
+                       [f"{len(reasons)} red flag(s)" if required
+                        else "no automated red flags on this tab"])
+    reason = Field.derived(
+        reasons or ["none from automated checks; still subject to normal sampling"],
+        0.7, ["triggers are heuristic; a clean tab is not a guarantee"],
+    )
+    return yn, reason
+
+
+def assess_tab(s, wx, reads_set, read_by_set) -> TabAssessment:
+    ta = TabAssessment()
+    has_up = bool(reads_set)
+    has_down = bool(read_by_set)
+    ta.tab_name = Field.extracted(s.name,
+                                  ["hidden sheet" for _ in [1] if s.state != "visible"])
+    ta.tab_category = _tab_category(s, wx, has_down)
+    ta.tab_information_analysis = _tab_information(s, has_up, has_down)
+    ta.key_calculation_transformation_logic = _tab_key_calc(s)
+    ta.upstream_dependencies = _tab_upstream(s, wx, reads_set)
+    ta.downstream_dependencies = _tab_downstream(s, read_by_set)
+    ta.human_validation_required, ta.validation_reason = _human_validation(s, wx)
+    ta.tab_purpose_description = Field.pending(
+        "needs_llm", "narrative purpose from headers + category + calculations")
+    return ta
+
+
 def assess(wx: WorkbookXray) -> Assessment:
-    """Full assessment. Step 1 fills the file level; tabs come in Step 2."""
-    return Assessment(file=assess_file(wx), tabs=[])
+    """Full assessment: file level (Step 1) and every tab (Step 2)."""
+    reads, read_by = _dependency_maps(wx)
+    tabs = [
+        assess_tab(s, wx, reads.get(s.name, set()), read_by.get(s.name, set()))
+        for s in wx.sheets
+    ]
+    return Assessment(file=assess_file(wx), tabs=tabs)
 
 
 def to_dict(a: Assessment) -> dict:
