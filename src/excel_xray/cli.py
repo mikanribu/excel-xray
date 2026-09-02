@@ -68,6 +68,7 @@ def main() -> int:
 
     ok = partial = failed = 0
     reasons: dict[str, list[str]] = {}
+    assess_batch: list = []  # collected for corpus-aware assessment
     for p in paths:
         t0 = time.time()
         try:
@@ -87,13 +88,12 @@ def main() -> int:
             continue
 
         if args.assess:
-            assessor = None
-            if args.llm:
-                from .narrative import ClaudeAssessor
-                assessor = ClaudeAssessor(model=args.model)
-            print(json.dumps(assessment_to_dict(assess(wx, assessor)),
-                             indent=2, default=str))
-        elif args.json:
+            # Defer: duplication/consolidation need the whole set at once.
+            assess_batch.append(wx)
+            ok += wx.parse_status == "full"
+            partial += wx.parse_status == "partial"
+            continue
+        if args.json:
             print(to_json(wx))
         else:
             name = os.path.splitext(os.path.basename(p))[0]
@@ -107,6 +107,21 @@ def main() -> int:
                   f"{low:2} low-conf  {time.time()-t0:5.1f}s  -> {dest}")
         ok += wx.parse_status == "full"
         partial += wx.parse_status == "partial"
+
+    if args.assess and assess_batch:
+        assessor = None
+        if args.llm:
+            from .narrative import ClaudeAssessor
+            assessor = ClaudeAssessor(model=args.model)
+        if len(assess_batch) > 1:
+            from .corpus import assess_corpus
+            results = assess_corpus(assess_batch, assessor)
+            payload = [assessment_to_dict(r) for r in results]
+        else:
+            # A single file cannot support duplication/consolidation findings;
+            # those stay needs_corpus.
+            payload = assessment_to_dict(assess(assess_batch[0], assessor))
+        print(json.dumps(payload, indent=2, default=str))
 
     total = len(paths)
     print(f"\ncoverage: {ok}/{total} full, {partial} partial, {failed} unreadable",
