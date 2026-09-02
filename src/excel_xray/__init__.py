@@ -10,6 +10,7 @@ result as a self-contained HTML report or JSON.
 from __future__ import annotations
 
 from .assessment import Assessment, FileAssessment, TabAssessment, assess
+from .narrative import ClaudeAssessor, Narrative, OfflineAssessor
 from .ooxml import WorkbookStructure, read_structure
 from .report import build_report, write_report
 from .scan import (
@@ -36,6 +37,9 @@ __all__ = [
     "Assessment",
     "FileAssessment",
     "TabAssessment",
+    "OfflineAssessor",
+    "ClaudeAssessor",
+    "Narrative",
     "main",
 ]
 

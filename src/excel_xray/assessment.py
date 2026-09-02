@@ -445,6 +445,23 @@ def _retirement(wx: WorkbookXray) -> Field:
                            "knowable from the file alone"])
 
 
+_BUSINESS_AREA = {
+    "Calculation": "Calculation / modelling",
+    "Reconciliation": "Reconciliation / control",
+    "Data Transformation": "Data preparation / transformation",
+    "Reporting": "Reporting / MI",
+    "Manual Input": "Manual data capture",
+    "Other": "General-purpose / other",
+}
+
+
+def _business_area(logic_type: Field) -> Field:
+    """Best-fit process classification, mapped from the detected logic type."""
+    area = _BUSINESS_AREA.get(logic_type.value, "General-purpose / other")
+    return Field.derived(area, logic_type.confidence or 0.5,
+                         [f"mapped from logic type '{logic_type.value}'"])
+
+
 # ------------------------------------------------------------------- entry
 
 
@@ -461,8 +478,7 @@ def assess_file(wx: WorkbookXray) -> FileAssessment:
     fa.source_system = _source_system(wx)
     fa.euc_preparer = _euc_preparer(wx)
 
-    # Fact Assessment — deferred
-    fa.business_area_process = Field.pending("needs_llm", "classify from purpose + logic")
+    # Fact Assessment — deferred (narrative fields filled by the assessor step)
     fa.purpose_of_file = Field.pending("needs_llm", "narrative from structure + headers")
     fa.key_output_outcome = Field.pending("needs_llm", "business outcome the model supports")
     fa.key_outputs = Field.pending("needs_llm", "name outputs from terminal/reporting tabs")
@@ -480,6 +496,7 @@ def assess_file(wx: WorkbookXray) -> FileAssessment:
 
     # Workbook logic / Automation — extracted / derived
     fa.logic_type = _logic_type(wx, t)
+    fa.business_area_process = _business_area(fa.logic_type)
     fa.key_calculations_logic = _key_calculations(wx, t)
     fa.manual_intervention = _manual_intervention(wx, t)
     fa.macros_vba_external_links = _macros_links(wx)
@@ -696,14 +713,45 @@ def assess_tab(s, wx, reads_set, read_by_set) -> TabAssessment:
     return ta
 
 
-def assess(wx: WorkbookXray) -> Assessment:
-    """Full assessment: file level (Step 1) and every tab (Step 2)."""
+def _apply_narrative(a: Assessment, narr, basis: str, label: str) -> None:
+    """Write an assessor's :class:`~excel_xray.narrative.Narrative` onto the
+    narrative fields, tagging each with the assessor's basis."""
+    ev = [f"{basis} by {label}"]
+
+    def put(fld, value):
+        if value is not None:
+            fld.value = value
+            fld.basis = basis
+            fld.confidence = 0.7 if basis == "inferred" else 0.4
+            fld.evidence = ev + (
+                [] if basis == "inferred"
+                else ["offline template — enable the LLM assessor for a considered answer"]
+            )
+
+    put(a.file.purpose_of_file, narr.purpose_of_file)
+    put(a.file.key_output_outcome, narr.key_output_outcome)
+    put(a.file.key_outputs, narr.key_outputs)
+    for ta in a.tabs:
+        put(ta.tab_purpose_description, narr.tabs.get(ta.tab_name.value))
+
+
+def assess(wx: WorkbookXray, assessor=None) -> Assessment:
+    """Full assessment: deterministic fields (Steps 1-3) plus the narrative
+    fields (Step 4) filled by ``assessor`` — the offline stub by default, so the
+    pipeline stays network-free unless a model-backed assessor is passed."""
+    from .narrative import OfflineAssessor, build_bundle
+
     reads, read_by = _dependency_maps(wx)
     tabs = [
         assess_tab(s, wx, reads.get(s.name, set()), read_by.get(s.name, set()))
         for s in wx.sheets
     ]
-    return Assessment(file=assess_file(wx), tabs=tabs)
+    a = Assessment(file=assess_file(wx), tabs=tabs)
+
+    assessor = assessor or OfflineAssessor()
+    narr = assessor.narrate(build_bundle(a, wx))
+    _apply_narrative(a, narr, assessor.basis, assessor.label)
+    return a
 
 
 def to_dict(a: Assessment) -> dict:

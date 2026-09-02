@@ -1,11 +1,14 @@
-"""Step 1 — file-level EUC assessment fields."""
+"""EUC assessment fields (Steps 1-4)."""
 
 from __future__ import annotations
+
+import json
 
 from excel_xray import assess
 
 
-VALID_BASES = {"extracted", "derived", "needs_llm", "needs_human", "needs_corpus"}
+VALID_BASES = {"extracted", "derived", "drafted", "inferred",
+               "needs_llm", "needs_human", "needs_corpus"}
 
 
 def test_every_field_declares_a_valid_basis(xray):
@@ -43,11 +46,12 @@ def test_manual_intervention_flags_hardcoded_inputs(xray):
 
 def test_deferred_fields_carry_intended_basis(xray):
     fa = assess(xray).file
-    assert fa.purpose_of_file.basis == "needs_llm"
+    # These stay genuinely deferred after Step 4.
     assert fa.usage_frequency.basis == "needs_human"
+    assert fa.completion_timeline.basis == "needs_human"
     assert fa.potential_duplication.basis == "needs_corpus"
     # Deferred fields have no fabricated value.
-    assert fa.purpose_of_file.value is None
+    assert fa.usage_frequency.value is None
 
 
 def test_key_calculations_extracted(xray):
@@ -153,3 +157,65 @@ def test_months_since_helper():
     assert _months_since("not-a-date") is None
     assert _months_since("2020-01-01T00:00:00") >= 12
     assert _months_since("2020-01-01T00:00:00Z") >= 12  # tz-aware parses too
+
+
+# ------------------------------------------------- narrative (Step 4)
+
+
+def test_business_area_derived_from_logic(xray):
+    fa = assess(xray).file
+    assert fa.business_area_process.basis == "derived"
+    assert fa.business_area_process.value == "Calculation / modelling"
+
+
+def test_offline_narrative_is_drafted_and_grounded(xray):
+    # Default assessor is the offline stub — no network, basis "drafted".
+    fa = assess(xray).file
+    assert fa.purpose_of_file.basis == "drafted"
+    assert fa.purpose_of_file.value and "calculation" in fa.purpose_of_file.value.lower()
+    assert fa.key_outputs.basis == "drafted"
+    assert isinstance(fa.key_outputs.value, list) and fa.key_outputs.value
+
+
+def test_every_tab_gets_a_purpose(xray):
+    for t in assess(xray).tabs:
+        assert t.tab_purpose_description.basis == "drafted"
+        assert t.tab_purpose_description.value
+
+
+def test_custom_assessor_marks_fields_inferred(xray):
+    from excel_xray.narrative import Narrative
+
+    class FakeLLM:
+        basis = "inferred"
+        label = "fake"
+
+        def narrate(self, bundle):
+            names = [t["name"] for t in bundle["tabs"]]
+            return Narrative(
+                purpose_of_file="A considered purpose.",
+                key_output_outcome="A considered outcome.",
+                key_outputs=["out"],
+                tabs={n: f"purpose of {n}" for n in names},
+            )
+
+    a = assess(xray, assessor=FakeLLM())
+    assert a.file.purpose_of_file.basis == "inferred"
+    assert a.file.purpose_of_file.value == "A considered purpose."
+    assert all(t.tab_purpose_description.basis == "inferred" for t in a.tabs)
+
+
+def test_parse_json_tolerates_fenced_output():
+    from excel_xray.narrative import _parse_json
+    assert _parse_json('```json\n{"a": 1}\n```') == {"a": 1}
+    assert _parse_json('here you go: {"a": 2} thanks') == {"a": 2}
+
+
+def test_bundle_carries_no_cell_values(xray):
+    # Privacy: the evidence bundle sent to a model must not embed cell values.
+    from excel_xray.narrative import build_bundle
+    a = assess(xray)
+    bundle = build_bundle(a, xray)
+    blob = json.dumps(bundle)
+    # A distinctive cached figure from Calc!C5 must not appear.
+    assert "59937" not in blob

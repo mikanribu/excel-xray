@@ -49,6 +49,11 @@ def main() -> int:
     ap.add_argument("--json", action="store_true", help="emit scan JSON to stdout")
     ap.add_argument("--assess", action="store_true",
                     help="emit the EUC assessment JSON to stdout")
+    ap.add_argument("--llm", action="store_true",
+                    help="use the Claude assessor for narrative fields "
+                         "(needs the 'anthropic' package + a credential)")
+    ap.add_argument("--model", default="claude-opus-5",
+                    help="model id for --llm (default: claude-opus-5)")
     ap.add_argument("--max-rows", type=int, default=200_000)
     args = ap.parse_args()
 
@@ -82,7 +87,12 @@ def main() -> int:
             continue
 
         if args.assess:
-            print(json.dumps(assessment_to_dict(assess(wx)), indent=2, default=str))
+            assessor = None
+            if args.llm:
+                from .narrative import ClaudeAssessor
+                assessor = ClaudeAssessor(model=args.model)
+            print(json.dumps(assessment_to_dict(assess(wx, assessor)),
+                             indent=2, default=str))
         elif args.json:
             print(to_json(wx))
         else:
