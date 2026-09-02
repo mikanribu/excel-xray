@@ -16,6 +16,10 @@ import sys
 import time
 import traceback
 
+import json
+
+from .assessment import assess
+from .assessment import to_dict as assessment_to_dict
 from .report import write_report
 from .scan import UnreadableWorkbook, to_json, xray_workbook
 
@@ -42,7 +46,9 @@ def main() -> int:
     )
     ap.add_argument("target", help="workbook or folder")
     ap.add_argument("-o", "--out", default=None, help="output directory")
-    ap.add_argument("--json", action="store_true", help="emit JSON to stdout")
+    ap.add_argument("--json", action="store_true", help="emit scan JSON to stdout")
+    ap.add_argument("--assess", action="store_true",
+                    help="emit the EUC assessment JSON to stdout")
     ap.add_argument("--max-rows", type=int, default=200_000)
     args = ap.parse_args()
 
@@ -75,7 +81,9 @@ def main() -> int:
                 traceback.print_exc()
             continue
 
-        if args.json:
+        if args.assess:
+            print(json.dumps(assessment_to_dict(assess(wx)), indent=2, default=str))
+        elif args.json:
             print(to_json(wx))
         else:
             name = os.path.splitext(os.path.basename(p))[0]
