@@ -70,7 +70,7 @@ h1{margin:0;font-size:30px;letter-spacing:-.02em;font-weight:650;word-break:brea
 @media(max-width:820px){.body{grid-template-columns:1fr}}
 .plateWrap{padding:16px;background:var(--plate);border-right:1px solid var(--rule)}
 .plate{position:relative;width:100%}
-.plate canvas{display:block;width:100%;image-rendering:pixelated;border:1px solid var(--grid)}
+.plate canvas{display:block;margin:0 auto;max-width:100%;image-rendering:pixelated;border:1px solid var(--grid)}
 .plateCap{color:#8A9AB5;font:11px/1.5 ui-monospace,monospace;margin-top:9px}
 .regions{padding:6px 16px 16px}
 .reg{border-bottom:1px solid var(--rule);padding:13px 0}
@@ -129,14 +129,19 @@ table.matrix td{min-width:120px;max-width:320px;white-space:normal;vertical-alig
 """
 
 JS = """
+const PLATE_MAX_ROWS = 120, PLATE_MAX_COLS = 60, BOX_W = 300, BOX_H = 340;
 function drawPlate(cv, data){
   const {rows, cols, cells, regions} = data;
-  const R = Math.max(rows, 8), C = Math.max(cols, 6);
-  const cs = Math.max(3, Math.min(9, Math.floor(560 / C)));
+  // Bound the grid so a 10k-row sheet is a thumbnail, not a giant strip. Cells
+  // beyond the cap are not drawn (occupancy is already clipped server-side).
+  const R = Math.max(Math.min(rows, PLATE_MAX_ROWS), 8);
+  const C = Math.max(Math.min(cols, PLATE_MAX_COLS), 6);
+  let cs = Math.floor(Math.min(BOX_W / C, BOX_H / R));
+  cs = Math.max(2, Math.min(10, cs));
   const w = C * cs, h = R * cs;
   const dpr = window.devicePixelRatio || 1;
   cv.width = w * dpr; cv.height = h * dpr;
-  cv.style.height = (h * (cv.clientWidth / w)) + 'px';
+  cv.style.width = w + 'px'; cv.style.height = h + 'px';  // natural size, no stretch
   const g = cv.getContext('2d');
   g.scale(dpr, dpr);
   g.fillStyle = '#182437'; g.fillRect(0, 0, w, h);
@@ -289,7 +294,9 @@ def build_report(wx: WorkbookXray, assessment=None) -> str:
           f"<canvas data-plate='{_esc(json.dumps(plate))}'></canvas></div>"
           f"<div class='plateCap'>{_esc(s.dimension or '')} &middot; density "
           f"{s.density:.0%}"
-          + (" &middot; plate truncated" if s.occupancy_truncated else "")
+          + (f" &middot; overview shows first {min(s.max_row, 120):,}&times;"
+             f"{min(s.max_col, 60)} of {s.max_row:,}&times;{s.max_col}"
+             if s.occupancy_truncated else "")
           + "</div></div>")
 
         A("<div class='regions'>")
