@@ -17,3 +17,6 @@ wheels/
 
 # OS cruft
 .DS_Store
+
+# Generated report output
+out/
