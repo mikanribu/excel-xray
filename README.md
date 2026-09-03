@@ -134,8 +134,11 @@ uv sync --extra llm
 ANTHROPIC_API_KEY=sk-ant-... uv run excel-xray file.xlsx --assess --llm
 ```
 
-Only a **value-free structural bundle** (headers + normalised formula shapes,
-never cell values) is sent to the model.
+Or put the key in a `.env` file (copy [.env.example](.env.example) to `.env`) —
+with `--llm` the CLI loads it automatically. `.env` is git-ignored, so the key is
+never committed. The SDK also accepts an `ant auth login` profile if you have
+one. Only a **value-free structural bundle** (headers + normalised formula
+shapes, never cell values) is sent to the model.
 
 ### Privacy
 

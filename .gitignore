@@ -9,6 +9,9 @@ wheels/
 # Virtual environments
 .venv
 
+# Secrets (.env.example is committed; real .env is not)
+.env
+
 # Test / tooling caches
 .pytest_cache/
 

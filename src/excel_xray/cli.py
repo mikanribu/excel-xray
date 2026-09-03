@@ -59,6 +59,15 @@ def main() -> int:
     ap.add_argument("--max-rows", type=int, default=200_000)
     args = ap.parse_args()
 
+    if args.llm:
+        # Load a local .env so ANTHROPIC_API_KEY can live there. Best-effort:
+        # python-dotenv ships with the [llm] extra, so this is a no-op otherwise.
+        try:
+            from dotenv import load_dotenv
+            load_dotenv()
+        except ImportError:
+            pass
+
     paths = collect(args.target)
     if not paths:
         print(f"no workbooks found under {args.target}", file=sys.stderr)
