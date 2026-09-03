@@ -119,8 +119,8 @@ td.grp{font:600 10px/1.3 ui-monospace,monospace;letter-spacing:.06em;
   text-transform:uppercase;color:var(--dim);white-space:nowrap}
 td.fld{font-weight:600;white-space:nowrap;color:var(--ink)}
 table.matrix td:first-child{font-weight:600;white-space:nowrap}
-table.matrix td{max-width:230px}
-.cellv{display:block;max-height:3.4em;overflow:hidden;text-overflow:ellipsis}
+table.matrix td{min-width:120px;max-width:320px;white-space:normal;vertical-align:top}
+.cellv{display:block;overflow-wrap:anywhere;word-break:break-word}
 .badge{display:inline-block;font:600 9px/1.4 ui-monospace,monospace;
   letter-spacing:.04em;padding:1px 5px;border-radius:2px;color:#fff;
   white-space:nowrap;vertical-align:middle}
