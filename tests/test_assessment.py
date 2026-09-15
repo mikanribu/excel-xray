@@ -21,7 +21,10 @@ def test_extracted_facts(xray):
     fa = assess(xray).file
     assert fa.file_name.value == "messy_reserving_model.xlsx"
     assert fa.file_id.basis == "extracted" and len(fa.file_id.value) == 12
-    assert fa.macros_vba_external_links.value == ["none detected"]
+    macros = fa.macros_vba_external_links.value
+    assert macros["vba"] == {"present": False, "modules": []}
+    assert macros["power_query"] is False
+    assert macros["external_workbook_links"] == 0
 
 
 def test_complexity_is_low_for_small_fixture(xray):
@@ -39,9 +42,14 @@ def test_logic_type_is_calculation(xray):
 
 def test_manual_intervention_flags_hardcoded_inputs(xray):
     fa = assess(xray).file
-    assert fa.manual_intervention.value in {"Low", "Medium", "High"}
-    # 66 formulas carry a hardcoded number in this fixture.
-    assert any("hardcoded" in e for e in fa.manual_intervention.evidence)
+    # No High/Medium/Low from a non-formula-cell percentage any more: either a
+    # concrete per-tab manual-entry finding, or needs_human with a question.
+    assert fa.manual_intervention.basis in {"derived", "needs_human"}
+    if fa.manual_intervention.basis == "derived":
+        assert isinstance(fa.manual_intervention.value, dict)
+        assert any("hardcoded" in v for v in fa.manual_intervention.value.values())
+    else:
+        assert any("reviewer question" in e for e in fa.manual_intervention.evidence)
 
 
 def test_deferred_fields_carry_intended_basis(xray):
@@ -89,13 +97,14 @@ def test_tab_category_valid_or_uncertain(xray):
 def test_assumptions_is_input_feeding_calc(xray):
     t = _tab(xray, "Assumptions")
     assert t.tab_category.value == "Input"
-    assert t.downstream_dependencies.value["in_workbook"] == ["sheet: Calc"]
+    consumers = t.downstream_dependencies.value["in_workbook"]
+    assert consumers == [{"sheet": "Calc", "role": "final output"}]
 
 
 def test_calc_is_calculation_reading_assumptions(xray):
     t = _tab(xray, "Calc")
     assert t.tab_category.value == "Calculation"
-    assert "sheet: Assumptions" in t.upstream_dependencies.value
+    assert "Assumptions" in t.upstream_dependencies.value["in_workbook_sheets"]
 
 
 def test_calc_needs_validation_for_error_and_hardcodes(xray):
@@ -113,12 +122,19 @@ def test_downstream_cross_file_left_to_corpus(xray):
 
 
 def test_simplification_flags_hardcodes_and_hidden_sheet(xray):
+    # One structured candidate per (worksheet, complexity issue) — not one
+    # mixed list of hidden sheets, errors, volatile functions and hardcodes.
     fa = assess(xray).file
     sf = fa.potential_simplification
     assert sf.basis == "derived"
     assert sf.value["verdict"] == "Yes"
-    ops = " ".join(sf.value["opportunities"])
-    assert "hardcoded" in ops and "hidden" in ops
+    candidates = sf.value["candidates"]
+    assert candidates
+    for c in candidates:
+        assert {"worksheet", "business_activity", "current_complexity",
+                "proposed_change", "expected_benefit", "evidence",
+                "requires_human_confirmation"} <= c.keys()
+    assert any("hardcoded" in c["current_complexity"] for c in candidates)
 
 
 def test_automation_is_a_candidate(xray):
@@ -126,16 +142,20 @@ def test_automation_is_a_candidate(xray):
     au = fa.potential_automation
     assert au.basis == "derived"
     assert au.value["verdict"] in {"Yes", "Possibly"}
-    assert au.value["drivers"]
+    candidates = au.value["candidates"]
+    assert candidates
+    for c in candidates:
+        assert c["verdict"] in {"Candidate", "Candidate — workflow confirmation required"}
 
 
-def test_retirement_defers_when_no_signal(xray):
-    # A freshly written fixture with no backup-naming has no retirement signal.
+def test_retirement_never_inferred_from_hidden_or_age(xray):
+    # Retirement is never inferred from hidden sheets, cached errors, file age
+    # or a suggestive filename — always owner-decision, with a targeted ask.
     fa = assess(xray).file
     rt = fa.potential_retirement
-    assert rt.basis in {"derived", "needs_human"}
-    if rt.basis == "needs_human":
-        assert rt.value["verdict"] == "No automated retirement signal"
+    assert rt.basis == "needs_human"
+    assert rt.value["verdict"] == "Not established — owner decision required."
+    assert set(rt.value["confirmation_needed"]) >= {"active usage", "owner"}
 
 
 def test_reconciliation_absent_on_calc_model(xray):
@@ -163,9 +183,12 @@ def test_months_since_helper():
 
 
 def test_business_area_derived_from_logic(xray):
+    # A workbook can support more than one process — logic_types is the primary
+    # driver and every detected activity is joined into the business area.
     fa = assess(xray).file
     assert fa.business_area_process.basis == "derived"
-    assert fa.business_area_process.value == "Calculation / modelling"
+    assert "Calculation / modelling" in fa.business_area_process.value
+    assert "Calculation" in fa.logic_types.value
 
 
 def test_offline_narrative_is_drafted_and_grounded(xray):
@@ -173,8 +196,11 @@ def test_offline_narrative_is_drafted_and_grounded(xray):
     fa = assess(xray).file
     assert fa.purpose_of_file.basis == "drafted"
     assert fa.purpose_of_file.value and "calculation" in fa.purpose_of_file.value.lower()
-    assert fa.key_outputs.basis == "drafted"
-    assert isinstance(fa.key_outputs.value, list) and fa.key_outputs.value
+    # key_outputs is deterministic (Step 12): final deliverables vs supporting/
+    # intermediate/input/mapping tabs, not narrative-supplied.
+    assert fa.key_outputs.basis == "derived"
+    assert isinstance(fa.key_outputs.value, dict)
+    assert "final_business_deliverables" in fa.key_outputs.value
 
 
 def test_every_tab_gets_a_purpose(xray):

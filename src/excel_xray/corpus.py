@@ -16,6 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from .assessment import Field, assess
+from .review_rules import duplication_corpus_note
 from .scan import WorkbookXray
 
 # A pair at/above this overall similarity is treated as materially duplicative.
@@ -73,10 +74,19 @@ def _jaccard(a: set, b: set) -> float:
 
 
 def similarity(a: Fingerprint, b: Fingerprint) -> dict:
-    """Component and overall similarity in [0, 1]."""
+    """Component and overall similarity in [0, 1].
+
+    ``skeleton``/``function`` read as *formula similarity*, ``header`` doubles
+    as a proxy for *input/output similarity* (column labels cover both), and
+    ``dependency`` (shared sheet names) is the closest signal this lighter,
+    two-file-friendly fingerprint can offer for dependency similarity — a
+    fuller four-signal breakdown (separate input/output/topology) is
+    available from the folder-wide estate comparison (``--estate``).
+    """
     sk = _jaccard(a.skeletons, b.skeletons)
     hd = _jaccard(a.headers, b.headers)
     fn = _jaccard(a.functions, b.functions)
+    dep = _jaccard(a.sheet_names, b.sheet_names)
     if a.skeletons or b.skeletons:
         overall = 0.6 * sk + 0.3 * hd + 0.1 * fn
     else:  # value/data workbooks with no formulas: lean on structure
@@ -85,6 +95,7 @@ def similarity(a: Fingerprint, b: Fingerprint) -> dict:
         "skeleton": round(sk, 3),
         "header": round(hd, 3),
         "function": round(fn, 3),
+        "dependency": round(dep, 3),
         "overall": round(overall, 3),
     }
 
@@ -95,9 +106,11 @@ def _apply_corpus(assessment, fp: Fingerprint, others: list[Fingerprint]) -> Non
 
     if not others:
         note = "only one workbook in the corpus — no comparison possible"
-        fa.potential_duplication = Field.derived({"verdict": "No", "matches": []}, 0.4, [note])
+        value = {"verdict": "No", "matches": [], "corpus_compared": 0,
+                 "similarity_threshold": DUP_THRESHOLD}
+        fa.potential_duplication = Field.derived(value, 0.4, [note])
         fa.similar_duplicate_files = Field.derived([], 0.4, [note])
-        fa.potential_consolidation = Field.derived({"verdict": "No"}, 0.4, [note])
+        fa.potential_consolidation = Field.derived({"verdict": "No", "corpus_compared": 0}, 0.4, [note])
         return
 
     scored = sorted(
@@ -115,15 +128,32 @@ def _apply_corpus(assessment, fp: Fingerprint, others: list[Fingerprint]) -> Non
         if s["overall"] >= DUP_THRESHOLD or s["skeleton"] >= SKELETON_DUP
     ]
 
-    top = scored[0][1]["overall"]
+    top_fp, top_sig = scored[0]
+    caveat = duplication_corpus_note(len(others))
+    strongest = {"file": top_fp.file_name, "score": top_sig["overall"],
+                 "formula_similarity": top_sig["skeleton"],
+                 "input_output_similarity": top_sig["header"],
+                 "dependency_similarity": top_sig["dependency"]}
+
+    ev = [f"{len(others)} other workbook(s) compared; strongest candidate "
+          f"{top_fp.file_name} at {top_sig['overall']}"]
+    if caveat:
+        ev.append(caveat)
     fa.similar_duplicate_files = Field.derived(
         [m["file"] for m in similar] or ["none above similarity threshold"],
-        0.6, [f"{len(others)} other workbook(s) compared; top overall {top}"],
+        0.6 if not caveat else 0.4, ev,
     )
+
+    dup_ev = [f"{len(dups)} match(es) at/above duplication threshold {DUP_THRESHOLD}",
+              f"corpus compared: {len(others)}", f"strongest candidate: {strongest}"]
+    if caveat:
+        dup_ev.append(caveat)
     fa.potential_duplication = Field.derived(
-        {"verdict": "Yes" if dups else "No", "matches": dups},
-        0.6 + (0.2 if dups else 0.0),
-        [f"{len(dups)} match(es) at/above duplication threshold {DUP_THRESHOLD}"],
+        {"verdict": ("No — limited corpus" if not dups and caveat else "Yes" if dups else "No"),
+         "matches": dups, "corpus_compared": len(others),
+         "similarity_threshold": DUP_THRESHOLD, "strongest_candidate": strongest},
+        (0.6 + (0.2 if dups else 0.0)) if not caveat else 0.4,
+        dup_ev,
     )
 
     # Consolidation: related workbooks sharing the same logic type. Exact

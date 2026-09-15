@@ -33,6 +33,7 @@ FILE_FIELDS = [
     ("Key AI Finding / Observation", "potential_automation", "Potential Automation"),
     ("Key AI Finding / Observation", "potential_retirement", "Potential Retirement"),
     ("Workbook logic / Automation", "logic_type", "Logic Type"),
+    ("Workbook logic / Automation", "logic_types", "Logic Types"),
     ("Workbook logic / Automation", "key_calculations_logic", "Key calculations / logic"),
     ("Workbook logic / Automation", "reconciliation_logic", "Reconciliation logic"),
     ("Workbook logic / Automation", "manual_intervention", "Manual intervention"),
@@ -41,7 +42,9 @@ FILE_FIELDS = [
 
 TAB_FIELDS = [
     ("Fact Assessment", "tab_name", "Tab Name"),
+    ("Fact Assessment", "tab_visibility", "Tab Visibility"),
     ("Fact Assessment", "tab_category", "Tab Category"),
+    ("Fact Assessment", "tab_roles", "Tab Roles"),
     ("Fact Assessment", "tab_purpose_description", "Tab Purpose / Description"),
     ("Fact Assessment", "tab_information_analysis", "Tab Information Analysis"),
     ("Fact Assessment", "key_calculation_transformation_logic",
@@ -69,18 +72,54 @@ def fmt_value(v) -> str:
             for k in ("matches", "candidates", "opportunities", "drivers", "signals"):
                 items = v.get(k)
                 if items:
-                    vals = [x.get("file") if isinstance(x, dict) else str(x) for x in items]
+                    vals = [_candidate_label(x) for x in items]
                     extras.append(f"{k}: " + ", ".join(vals))
             s = str(v["verdict"])
             return s + (" — " + "; ".join(extras) if extras else "")
-        if "top_functions" in v:
+        if "top_functions" in v:  # key_calculations_logic
             fns = ", ".join(v.get("top_functions", []))
             shapes = "; ".join(v.get("top_formula_shapes", [])[:3])
-            return " | ".join(p for p in (fns, shapes) if p) or "—"
-        if "in_workbook" in v:  # downstream deps
-            return "; ".join(v.get("in_workbook") or []) or "—"
+            desc = v.get("business_description")
+            descs = "; ".join(v.get("business_descriptions", []) or ([desc] if desc else []))
+            return " | ".join(p for p in (descs, fns, shapes) if p) or "—"
+        if "in_workbook" in v:  # tab downstream_dependencies
+            items = v.get("in_workbook") or []
+            return "; ".join(_candidate_label(x) for x in items) or "—"
+        if "final_business_deliverables" in v:  # file key_outputs
+            return "; ".join(f"{k}: {', '.join(vals)}" for k, vals in v.items() if vals) or "—"
+        if "vba" in v:  # macros_vba_external_links
+            vba = v.get("vba", {})
+            parts = [f"VBA: {'yes — ' + ', '.join(vba.get('modules', [])) if vba.get('present') else 'no'}",
+                    f"Power Query: {'yes' if v.get('power_query') else 'no'}",
+                    f"connections: {', '.join(v.get('data_connections', []) or ['none'])}",
+                    f"external links: {v.get('external_workbook_links', 0)}"]
+            return "; ".join(parts)
+        if "resolved" in v or "reviewer_questions" in v:  # reconciliation_logic
+            parts = [f"{d['tab']}: {d.get('source','?')} vs {d.get('comparison_target','?')} "
+                    f"on {d.get('matching_key','?')}" for d in v.get("resolved", [])]
+            parts += v.get("reviewer_questions", [])
+            return "; ".join(parts) or "—"
+        if "in_workbook_sheets" in v:  # key_inputs / upstream_dependencies grouped
+            parts = []
+            for k in ("in_workbook_sheets", "lookup_mapping_tables", "data_connections",
+                     "external_workbooks", "other_unresolved_sources"):
+                items = v.get(k)
+                if items and items not in (["none"], []):
+                    parts.append(f"{k}: " + ", ".join(_candidate_label(x) for x in items))
+            return "; ".join(parts) or "—"
         return json.dumps(v, default=str)
     return str(v)
+
+
+def _candidate_label(x) -> str:
+    """One short label for a structured list item (candidate/match/consumer)."""
+    if isinstance(x, dict):
+        for k in ("worksheet", "file", "sheet", "file_name"):
+            if k in x:
+                extra = x.get("role") or x.get("verdict") or x.get("current_complexity")
+                return f"{x[k]}" + (f" ({extra})" if extra else "")
+        return str(x)
+    return str(x)
 
 
 def _field(obj, attr):

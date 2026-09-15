@@ -71,10 +71,13 @@ def build_bundle(assessment, wx) -> dict:
         kc = ta.key_calculation_transformation_logic.value
         tabs.append({
             "name": name,
+            "visibility": ta.tab_visibility.value,
             "category": ta.tab_category.value,
+            "roles": ta.tab_roles.value,
             "information": ta.tab_information_analysis.value,
             "headers": headers[:20],
             "top_functions": (kc or {}).get("top_functions", []) if isinstance(kc, dict) else [],
+            "business_description": (kc or {}).get("business_description") if isinstance(kc, dict) else None,
             "upstream": ta.upstream_dependencies.value,
             "downstream": ta.downstream_dependencies.value.get("in_workbook")
             if isinstance(ta.downstream_dependencies.value, dict) else None,
@@ -86,6 +89,7 @@ def build_bundle(assessment, wx) -> dict:
         "business_area_process": val(fa.business_area_process),
         "complexity": val(fa.complexity),
         "logic_type": val(fa.logic_type),
+        "logic_types": val(fa.logic_types),
         "key_calculations": val(fa.key_calculations_logic),
         "key_inputs": val(fa.key_inputs),
         "sheet_count": len(wx.sheets),
@@ -120,7 +124,8 @@ class OfflineAssessor:
         logic = bundle.get("logic_type") or "Other"
         cats = [t["category"] for t in bundle["tabs"]]
         cat_counts = ", ".join(sorted({c for c in cats})) or "no classified tabs"
-        outputs = [t["name"] for t in bundle["tabs"] if t["category"] == "Output"]
+        outputs = [t["name"] for t in bundle["tabs"]
+                  if t["category"] == "Output" or "Output" in (t.get("roles") or [])]
         top_fns = (bundle.get("key_calculations") or {}).get("top_functions", []) \
             if isinstance(bundle.get("key_calculations"), dict) else []
 
@@ -132,8 +137,22 @@ class OfflineAssessor:
             + "."
         )
         inputs = bundle.get("key_inputs")
-        if inputs:
-            purpose += f" Inputs: {', '.join(map(str, inputs[:3]))}."
+        input_labels: list[str] = []
+        if isinstance(inputs, dict):
+            for key in ("in_workbook_sheets", "lookup_mapping_tables", "data_connections"):
+                for v in inputs.get(key) or []:
+                    if isinstance(v, str) and v not in ("none", "none identified",
+                                                        "none identified as a dedicated input tab"):
+                        input_labels.append(v)
+                    elif isinstance(v, dict):
+                        input_labels.append(str(v.get("name") or v.get("file_name") or v))
+            for ext in inputs.get("external_workbooks") or []:
+                if isinstance(ext, dict):
+                    input_labels += [f["file_name"] for f in ext.get("files", [])]
+        elif isinstance(inputs, list):
+            input_labels = [str(x) for x in inputs]
+        if input_labels:
+            purpose += f" Inputs: {', '.join(input_labels[:3])}."
 
         outcome = (
             f"Supports {(bundle.get('business_area_process') or logic).lower()}; "

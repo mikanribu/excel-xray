@@ -102,7 +102,11 @@ def main() -> int:
                     help="also write the EUC assessment as a CSV table")
     ap.add_argument("--estate", action="store_true",
                     help="compare workbooks across the folder: write an estate "
-                         "report (estate.html + estate_pairs.csv) to the out dir")
+                         "report (estate.<format> + estate_pairs.csv) to the out dir, "
+                         "and embed an Estate comparison sheet in each xlsx report")
+    ap.add_argument("--format", choices=["xlsx", "html"], default="xlsx",
+                    help="report format for the per-workbook and estate report "
+                         "(default: xlsx)")
     ap.add_argument("--max-rows", type=int, default=200_000)
     args = ap.parse_args()
 
@@ -188,17 +192,35 @@ def main() -> int:
         payload = [assessment_to_dict(a) for a in assessments]
         print(json.dumps(payload if len(payload) != 1 else payload[0],
                          indent=2, default=str))
-    elif not args.json and assessments is not None:
+
+    # Estate comparison is computed before the per-file reports so an xlsx
+    # report can embed it as its own sheet, per the required Excel content.
+    estate = insight = None
+    if args.estate and assessments is not None:
+        if len(assessments) < 2:
+            print("--estate needs more than one workbook to compare", file=sys.stderr)
+        else:
+            from .estate import build_estate
+            from .estate_insight import generate_estate_insight
+            pairs_in = [(wx, a) for (_, wx), a in zip(batch, assessments)]
+            estate = build_estate(pairs_in)
+            insight = generate_estate_insight(estate, _estate_assessor(args))
+
+    if not args.json and not args.assess and assessments is not None:
+        ext = "xlsx" if args.format == "xlsx" else "html"
         for (p, wx), a in zip(batch, assessments):
             name = os.path.splitext(os.path.basename(p))[0]
-            dest = os.path.join(outdir, f"xray_{name}.html")
-            write_report(wx, dest, a)
+            dest = os.path.join(outdir, f"xray_{name}.{ext}")
+            if args.format == "xlsx":
+                from .xlsx_report import write_xlsx_report
+                write_xlsx_report(wx, a, dest, estate=estate, estate_insight=insight)
+            else:
+                write_report(wx, dest, a)
             regions = sum(len(s.regions) for s in wx.sheets)
-            low = sum(1 for s in wx.sheets for r in s.regions
-                      if r.detect_confidence < 0.70)
+            need_review = sum(1 for t in a.tabs if t.human_validation_required.value == "Y")
             print(f"{wx.parse_status:8} {os.path.basename(p):46} "
                   f"{len(wx.sheets):3} sheets  {regions:3} regions  "
-                  f"{low:2} low-conf  {timings.get(p, 0):5.2f}s  -> {dest}")
+                  f"{need_review:2} need review  {timings.get(p, 0):5.2f}s  -> {dest}")
 
     if args.csv and assessments is not None:
         from .tabular import to_csv
@@ -206,24 +228,21 @@ def main() -> int:
         to_csv(named, args.csv)
         print(f"wrote {args.csv} ({len(named)} workbook(s))", file=sys.stderr)
 
-    if args.estate and assessments is not None:
-        if len(assessments) < 2:
-            print("--estate needs more than one workbook to compare", file=sys.stderr)
+    if estate is not None:
+        ext = "xlsx" if args.format == "xlsx" else "html"
+        dest = os.path.join(outdir, f"estate.{ext}")
+        csv_path = os.path.join(outdir, "estate_pairs.csv")
+        if args.format == "xlsx":
+            from .xlsx_report import write_estate_xlsx
+            write_estate_xlsx(estate, dest, insight)
         else:
-            from .estate import build_estate
-            from .estate_insight import generate_estate_insight
-            from .estate_report import write_estate_csv, write_estate_report
-            pairs_in = [(wx, a) for (_, wx), a in zip(batch, assessments)]
-            estate = build_estate(pairs_in)
-            insight_assessor = _estate_assessor(args)
-            insight = generate_estate_insight(estate, insight_assessor)
-            html_path = os.path.join(outdir, "estate.html")
-            csv_path = os.path.join(outdir, "estate_pairs.csv")
-            write_estate_report(estate, html_path, insight)
-            write_estate_csv(estate, csv_path)
-            print(f"{len(estate.fingerprints)} workbooks  "
-                  f"{len(estate.clusters)} families  {len(estate.pairs)} linked pairs"
-                  f"  -> {html_path}", file=sys.stderr)
+            from .estate_report import write_estate_report
+            write_estate_report(estate, dest, insight)
+        from .estate_report import write_estate_csv
+        write_estate_csv(estate, csv_path)
+        print(f"{len(estate.fingerprints)} workbooks  "
+              f"{len(estate.clusters)} families  {len(estate.pairs)} linked pairs"
+              f"  -> {dest}", file=sys.stderr)
 
     total = len(paths)
     print(f"\ncoverage: {ok}/{total} full, {partial} partial, {failed} unreadable",
