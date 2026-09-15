@@ -205,7 +205,8 @@ document.querySelectorAll('canvas[data-plate]').forEach(cv=>{
   }));
   const ids = panels.map(p => p.id);
   const wanted = (location.hash || '').slice(1);
-  activate(ids.includes(wanted) ? wanted : ids[0], true);
+  const fallback = ids.includes('tab-assessment') ? 'tab-assessment' : ids[0];
+  activate(ids.includes(wanted) ? wanted : fallback, true);
 })();
 
 document.querySelectorAll('.cellv.trunc').forEach(el=>{
@@ -281,9 +282,21 @@ def _table_tools(table_id: str, placeholder: str) -> str:
             f"<span class='rowCount'></span></div>")
 
 
-def _error_summary_html(review) -> str:
-    """Structured error summary for the report header — grouped by type,
-    sheet and region, never a raw list of cell references."""
+def _error_header(review) -> str:
+    """One-line, high-level warning for the always-visible header — the
+    grouped table and per-cell detail live in the Diagnostics tab instead."""
+    groups = review.error_groups
+    if not groups:
+        return ""
+    total = sum(g.count for g in groups)
+    return (f"<div class='warn'><b>{total} cached error cell(s)</b> across "
+           f"{len(groups)} group(s) — see the Diagnostics tab for the grouped "
+           f"summary, downstream impact and reviewer actions.</div>")
+
+
+def _error_detail(review) -> str:
+    """Grouped-by-type/sheet/region error summary plus the per-cell detail
+    table — the "too detailed to keep in the header" material, Diagnostics tab."""
     groups = review.error_groups
     if not groups:
         return ""
@@ -299,8 +312,9 @@ def _error_summary_html(review) -> str:
         )
     total = sum(g.count for g in groups)
     table = (
-        f"<div class='warn'><b>{total} cached error cell(s) across {len(groups)} "
-        f"group(s):</b></div>"
+        f"<h3>Error summary</h3>"
+        f"<p style='margin:6px 2px 10px;font-size:13px;color:var(--dim)'>"
+        f"{total} cached error cell(s) across {len(groups)} group(s).</p>"
         "<div class='scroll'><table class='euc' style='margin:6px 0 10px'>"
         "<tr><th>Type</th><th>Count</th><th>Sheet</th><th>Region</th><th>Area</th>"
         "<th>Downstream outputs</th><th>Recalc required</th><th>Reviewer action</th></tr>"
@@ -325,12 +339,25 @@ def _error_summary_html(review) -> str:
     return table
 
 
-def _hidden_summary_html(review) -> str:
+def _hidden_header(review) -> str:
+    """One-line, high-level warning for the always-visible header — the
+    purpose grouping lives in the Diagnostics tab instead."""
+    hs = review.hidden_summary
+    if not hs:
+        return ""
+    if not hs.get("hidden_count"):
+        return f"<div class='warn'>{_esc(hs.get('header', '0 worksheets are hidden.'))}</div>"
+    return (f"<div class='warn'>{_esc(hs['header'])} Hidden status is never treated "
+           f"as evidence a worksheet or workbook is obsolete — see the Diagnostics "
+           f"tab for the purpose grouping.</div>")
+
+
+def _hidden_detail(review) -> str:
     """'X of Y worksheets are hidden', grouped by likely purpose — never a
     bare list, and never framed as evidence of obsolescence."""
     hs = review.hidden_summary
     if not hs or not hs.get("hidden_count"):
-        return f"<div class='warn'>{_esc(hs.get('header', '0 worksheets are hidden.'))}</div>" if hs else ""
+        return ""
     rows = []
     for g in hs["groups"]:
         rows.append(
@@ -340,14 +367,31 @@ def _hidden_summary_html(review) -> str:
             f"<td>{_esc(g.explanation)}</td></tr>"
         )
     return (
-        f"<div class='warn'>{_esc(hs['header'])} Hidden sheets often hold working logic "
-        f"a visible report depends on — hidden status is never treated as evidence a "
-        f"worksheet or workbook is obsolete.</div>"
+        f"<h3>Hidden sheet groups</h3>"
+        f"<p style='margin:6px 2px 10px;font-size:13px;color:var(--dim)'>"
+        f"{_esc(hs['header'])} Hidden sheets often hold working logic a visible "
+        f"report depends on — hidden status is never treated as evidence a "
+        f"worksheet or workbook is obsolete.</p>"
         "<div class='scroll'><table class='euc' style='margin:6px 0 16px'>"
         "<tr><th>Purpose</th><th>Worksheets</th><th>Count</th>"
         "<th>Depended on by</th><th>Likely purpose</th></tr>"
         + "".join(rows) + "</table></div>"
     )
+
+
+def _render_diagnostics(review) -> str:
+    """Diagnostics tab: everything too detailed for the always-visible
+    header — grouped and per-cell error detail, hidden-sheet purpose
+    grouping. Only rendered when there is something to show."""
+    error_html = _error_detail(review)
+    hidden_html = _hidden_detail(review)
+    if not error_html and not hidden_html:
+        return ""
+    parts = ["<section class='assess'><h2>Diagnostics</h2>"]
+    parts.append(error_html)
+    parts.append(hidden_html)
+    parts.append("</section>")
+    return "".join(parts)
 
 
 def _render_assessment(assessment) -> str:
@@ -442,8 +486,8 @@ def build_report(wx: WorkbookXray, assessment=None) -> str:
     for w in wx.warnings:
         A(f"<div class='warn'>{_esc(w)}</div>")
     if assessment is not None:
-        A(_error_summary_html(assessment.review))
-        A(_hidden_summary_html(assessment.review))
+        A(_error_header(assessment.review))
+        A(_hidden_header(assessment.review))
     else:
         if errors:
             A(f"<div class='warn'><b>{len(errors)} cached error cell(s)</b> — run with "
@@ -461,12 +505,17 @@ def build_report(wx: WorkbookXray, assessment=None) -> str:
     else:
         sheets_ordered = wx.sheets
 
-    # ---- Tab bar: one tab for the EUC assessment (if present) plus one
-    # tab per sheet, so a many-sheet workbook navigates by click instead of
-    # by scrolling past every sheet's plate and region list. ----------------
+    # ---- Tab bar: Assessment first (selected by default — see initTabs in
+    # JS, which opens ids[0] absent a URL hash), then Diagnostics (error/
+    # hidden detail — too much for the always-visible header), then one tab
+    # per sheet, so a many-sheet workbook navigates by click instead of by
+    # scrolling past every sheet's plate and region list. --------------------
+    diagnostics_html = _render_diagnostics(assessment.review) if assessment is not None else ""
     A("<div class='tabbar'>")
     if assessment is not None:
         A("<button class='tabbtn' data-target='tab-assessment'>Assessment</button>")
+    if diagnostics_html:
+        A("<button class='tabbtn' data-target='tab-diagnostics'>Diagnostics</button>")
     for i, s in enumerate(sheets_ordered):
         hidden_tag = " &middot; hidden" if s.state != "visible" else ""
         A(f"<button class='tabbtn' data-target='tab-sheet-{i}'>{_esc(s.name)}"
@@ -476,6 +525,10 @@ def build_report(wx: WorkbookXray, assessment=None) -> str:
     if assessment is not None:
         A("<div class='tabpanel' id='tab-assessment'>")
         A(_render_assessment(assessment))
+        A("</div>")
+    if diagnostics_html:
+        A("<div class='tabpanel' id='tab-diagnostics'>")
+        A(diagnostics_html)
         A("</div>")
 
     for i, s in enumerate(sheets_ordered):
