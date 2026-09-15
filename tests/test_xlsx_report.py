@@ -65,7 +65,7 @@ def test_cli_defaults_to_xlsx(tmp_path, fixture_path):
         [sys.executable, "-m", "excel_xray", fixture_path, "-o", str(out)],
         check=True, capture_output=True, text=True,
     )
-    files = list(out.glob("*.xlsx"))
+    files = list(out.glob("**/*.xlsx"))
     assert files, "default format must be .xlsx"
     wb = openpyxl.load_workbook(files[0])
     assert "File assessment" in wb.sheetnames
@@ -78,7 +78,7 @@ def test_cli_html_format_still_available(tmp_path, fixture_path):
         [sys.executable, "-m", "excel_xray", fixture_path, "-o", str(out), "--format", "html"],
         check=True, capture_output=True, text=True,
     )
-    files = list(out.glob("*.html"))
+    files = list(out.glob("**/*.html"))
     assert files, "--format html must still produce an HTML report"
     html = files[0].read_text()
     assert "EUC assessment" in html

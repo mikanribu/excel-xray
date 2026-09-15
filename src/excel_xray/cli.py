@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 """Excel X-ray command line.
 
-  excel-xray FILE.xlsx                 HTML report next to the file
-  excel-xray FOLDER -o out/            every workbook in a folder
+  excel-xray FILE.xlsx                 xlsx report in a timestamped folder
+                                        next to the file
+  excel-xray FOLDER -o out/            every workbook in a folder, reports in
+                                        out/xray_<timestamp>/
+  excel-xray FILE.xlsx --format html   HTML report instead of xlsx
   excel-xray FILE.xlsx --json          machine-readable JSON to stdout
+
+Every run creates a fresh xray_<YYYYMMDD_HHMMSS>/ subfolder under the given
+(or default) output path, so repeated runs never overwrite an earlier report.
 
 Reads only. Never writes to, moves or renames a source file.
 """
@@ -72,7 +78,11 @@ def main() -> int:
         prog="excel-xray", description="Excel X-ray structural scanner"
     )
     ap.add_argument("target", help="workbook or folder")
-    ap.add_argument("-o", "--out", default=None, help="output directory")
+    ap.add_argument("-o", "--out", default=None,
+                    help="base output directory (default: next to the file, or "
+                         "the target folder itself); a timestamped "
+                         "xray_<YYYYMMDD_HHMMSS>/ subfolder is created under it "
+                         "on every run")
     ap.add_argument("--json", action="store_true", help="emit scan JSON to stdout")
     ap.add_argument("--assess", action="store_true",
                     help="emit the EUC assessment JSON to stdout")
@@ -138,9 +148,17 @@ def main() -> int:
         print(f"no workbooks found under {args.target}", file=sys.stderr)
         return 2
 
-    outdir = args.out or (args.target if os.path.isdir(args.target)
-                          else os.path.dirname(os.path.abspath(args.target)))
-    os.makedirs(outdir, exist_ok=True)
+    base_outdir = args.out or (args.target if os.path.isdir(args.target)
+                               else os.path.dirname(os.path.abspath(args.target)))
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    outdir = os.path.join(base_outdir, f"xray_{timestamp}")
+    # --json/--assess print to stdout and --csv writes to its own given path —
+    # none of those touch outdir. Only the report loop and --estate do, so
+    # skip creating an empty timestamped folder when neither applies.
+    writes_to_outdir = args.estate or (not args.json and not args.assess)
+    if writes_to_outdir:
+        os.makedirs(outdir, exist_ok=True)
+        print(f"writing reports to {outdir}", file=sys.stderr)
 
     ok = partial = failed = 0
     reasons: dict[str, list[str]] = {}
