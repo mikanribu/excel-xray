@@ -23,6 +23,8 @@ import time
 import traceback
 
 import json
+import shutil
+from pathlib import Path
 
 from .assessment import assess
 from .assessment import to_dict as assessment_to_dict
@@ -64,7 +66,11 @@ def collect(target: str) -> list[str]:
     if os.path.isfile(target):
         return [target]
     out = []
-    for root, _dirs, files in os.walk(target):
+    for root, dirs, files in os.walk(target):
+        # A repeat run under the same folder must not ingest a previous run's
+        # generated portfolio_review.xlsx as though it were a source EUC.
+        dirs[:] = [d for d in dirs if not d.startswith("xray_") and d not in
+                   {".git", ".venv", "__pycache__"}]
         for f in files:
             if f.startswith(SKIP_PREFIX):
                 continue
@@ -74,6 +80,15 @@ def collect(target: str) -> list[str]:
 
 
 def main() -> int:
+    if len(sys.argv) > 1 and sys.argv[1] == "serve":
+        serve_ap = argparse.ArgumentParser(prog="excel-xray serve",
+                                           description="Serve a portfolio run on localhost")
+        serve_ap.add_argument("run_dir", help="folder containing portfolio.sqlite")
+        serve_ap.add_argument("--port", type=int, default=8765)
+        serve_args = serve_ap.parse_args(sys.argv[2:])
+        from .portfolio_web import serve
+        serve(serve_args.run_dir, port=serve_args.port)
+        return 0
     ap = argparse.ArgumentParser(
         prog="excel-xray", description="Excel X-ray structural scanner"
     )
@@ -118,6 +133,12 @@ def main() -> int:
                     help="report format for the per-workbook and estate report "
                          "(default: xlsx)")
     ap.add_argument("--max-rows", type=int, default=200_000)
+    ap.add_argument("--portfolio", action="store_true",
+                    help="create a consolidated portfolio run (default for folders)")
+    ap.add_argument("--individual-reports", action="store_true",
+                    help="for a folder, retain the legacy one-report-per-EUC output")
+    ap.add_argument("--resume", metavar="RUN_DIR", default=None,
+                    help="resume a portfolio run, reusing unchanged scanned EUCs")
     args = ap.parse_args()
 
     if args.llm:
@@ -147,6 +168,25 @@ def main() -> int:
     if not paths:
         print(f"no workbooks found under {args.target}", file=sys.stderr)
         return 2
+
+    folder_portfolio = os.path.isdir(args.target) and not (
+        args.json or args.assess or args.estate or args.individual_reports)
+    if args.portfolio or args.resume or folder_portfolio:
+        from .portfolio import DB_NAME, SUMMARY_NAME, scan_portfolio
+        base = args.out or (args.target if os.path.isdir(args.target)
+                            else os.path.dirname(os.path.abspath(args.target)))
+        if args.resume and not (Path(args.resume) / DB_NAME).is_file():
+            ap.error(f"--resume requires an existing portfolio run containing {DB_NAME}")
+        run_dir = args.resume or os.path.join(
+            base, f"xray_{time.strftime('%Y%m%d_%H%M%S')}_{time.time_ns() % 1_000_000_000:09d}")
+        result = scan_portfolio(paths, run_dir, max_rows=args.max_rows,
+                                assessor=_narrative_assessor(args), resume=bool(args.resume))
+        if args.csv:
+            shutil.copyfile(os.path.join(run_dir, SUMMARY_NAME), args.csv)
+        print(f"Portfolio ready: {run_dir} ({result['stored']} EUCs; "
+              f"{result['failed']} failed; {result['reused']} reused)", file=sys.stderr)
+        print(f"Open with: excel-xray serve '{run_dir}'", file=sys.stderr)
+        return 0
 
     base_outdir = args.out or (args.target if os.path.isdir(args.target)
                                else os.path.dirname(os.path.abspath(args.target)))

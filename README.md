@@ -6,19 +6,57 @@ Scans a complicated financial workbook and produces two things:
    dependencies and quality flags, and
 2. an **EUC assessment** — the reviewer-facing fields a controls team needs
    (purpose, complexity, logic type, inputs, key findings, per-tab detail,
-   duplication across a folder) — as a self-contained HTML report, JSON, or CSV.
+   duplication across a folder) — as an Excel report or local portfolio dashboard.
 
 Read-only. Never writes to, moves or renames a source file.
 
 ```bash
-uv run excel-xray file.xlsx -o out/            # HTML report (structure + assessment)
-uv run excel-xray /path/to/folder -o out/      # one report per workbook + corpus findings
+uv run excel-xray file.xlsx -o out/            # individual Excel report
+uv run excel-xray /path/to/folder -o out/      # consolidated portfolio run
+uv run excel-xray serve out/xray_YYYYMMDD_HHMMSS  # localhost dashboard
 uv run excel-xray file.xlsx --assess           # EUC assessment as JSON to stdout
-uv run excel-xray /path/to/folder --csv euc.csv   # assessment as a flat CSV table
+uv run excel-xray /path/to/folder --csv euc.csv   # also copy one-row-per-EUC summary CSV
 uv run excel-xray /path/to/folder --estate -o out/   # compare EUCs across the estate
 uv run excel-xray file.xlsx --json             # raw structural scan as JSON
 uv run pytest                                  # accuracy + reader + assessment tests
 ```
+
+## Portfolio review for a folder of EUCs
+
+Folder input now defaults to a consolidated run. A fresh `xray_<timestamp>`
+directory contains `portfolio.sqlite` (the single indexed assessment store),
+`file_summary.csv` (one row per submitted EUC, including failed scans),
+`worksheet_details.csv`, `diagnostics.csv`, `portfolio_findings.csv`, and
+`portfolio_review.xlsx` with corresponding worksheets. The review workbook's
+first sheet is the file-level summary. No per-file JSON or report files are
+generated for a folder. A single-file input still produces the existing
+individual Excel report; `--format html` produces the individual HTML report.
+
+Start the dashboard with `excel-xray serve RUN_DIR` and open the printed local
+URL. It offers a paged file list, search, file and worksheet drill-down,
+portfolio findings, comparison of selected EUCs, and exports for the selected
+files (or all files if none are selected). The original EUC can be downloaded
+alone from its detail view, or with the selected analysis in a ZIP. The full
+individual HTML or Excel report is generated only when requested. The server
+binds to `127.0.0.1` by default.
+
+To recover from an interruption, run the same source folder with
+`--resume RUN_DIR`; unchanged successful files are reused and failures are
+retried. A changed source is rescanned. The originals remain at their source
+paths; moving or modifying them after a scan prevents original downloads and
+on-demand reports until the run is resumed. The ZIP contains the **actual
+workbook bytes**, including cell values; share it only with recipients cleared
+for those source files. The CSV, database, dashboard, and analysis Excel contain
+structural evidence and assessment text, not raw cell values.
+
+At 2,000 EUCs, the scan holds one workbook at a time. Cross-EUC comparison uses
+compact fingerprints retained in memory and performs pairwise comparisons;
+this is quadratic in file count, while stored output is limited to the 20
+strongest review matches per EUC. The dashboard recomputes similarity for
+selected files, so a pair remains comparable even if it was outside the
+stored shortlist. Use `--individual-reports` for the older one-report-per-file folder flow,
+or `--estate` for the original estate comparison. Those legacy modes retain
+their original batch-memory behaviour.
 
 ## Two layers
 
@@ -67,7 +105,7 @@ scan:
    cells/sec versus openpyxl's ~10k, with the whole workbook's formulas and
    values available at once.
 
-The package has **no openpyxl dependency**. Its cell reader is verified
+The scanner does not depend on openpyxl, but the Excel report writer does. Its cell reader is verified
 cell-for-cell against openpyxl on the fixture (values, formulas, bold, fill,
 border — zero mismatches); openpyxl is a test-only tool.
 
@@ -205,7 +243,7 @@ accuracy.
 ## Setup
 
 ```bash
-uv sync                      # runtime deps: lxml only
+uv sync                      # runtime deps: lxml and openpyxl
 uv sync --extra encrypted    # + olefile, to name encrypted files in triage
 uv sync --extra llm          # + anthropic, for the --llm narrative assessor
 ```

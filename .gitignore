@@ -20,3 +20,5 @@ wheels/
 
 # Generated report output
 out/
+sample_output/
+xray_*/
