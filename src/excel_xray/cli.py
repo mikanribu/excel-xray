@@ -3,12 +3,13 @@
 
   excel-xray FILE.xlsx                 xlsx report in a timestamped folder
                                         next to the file
-  excel-xray FOLDER -o out/            every workbook in a folder, reports in
-                                        out/xray_<timestamp>/
+  excel-xray FOLDER -o out/            consolidated portfolio in one
+                                        out/xray_<timestamp>_<suffix>/ folder
+  excel-xray serve RUN_DIR            local portfolio dashboard
   excel-xray FILE.xlsx --format html   HTML report instead of xlsx
   excel-xray FILE.xlsx --json          machine-readable JSON to stdout
 
-Every run creates a fresh xray_<YYYYMMDD_HHMMSS>/ subfolder under the given
+Every report run creates a fresh xray_<timestamp>/ subfolder under the given
 (or default) output path, so repeated runs never overwrite an earlier report.
 
 Reads only. Never writes to, moves or renames a source file.
@@ -96,7 +97,7 @@ def main() -> int:
     ap.add_argument("-o", "--out", default=None,
                     help="base output directory (default: next to the file, or "
                          "the target folder itself); a timestamped "
-                         "xray_<YYYYMMDD_HHMMSS>/ subfolder is created under it "
+                         "xray_<timestamp>/ subfolder is created under it "
                          "on every run")
     ap.add_argument("--json", action="store_true", help="emit scan JSON to stdout")
     ap.add_argument("--assess", action="store_true",
@@ -124,7 +125,8 @@ def main() -> int:
                     help="Azure OpenAI api-version (else $AZURE_OPENAI_API_VERSION, "
                          "default 2024-10-21)")
     ap.add_argument("--csv", default=None, metavar="PATH",
-                    help="also write the EUC assessment as a CSV table")
+                    help="for a portfolio folder, also copy the one-row-per-EUC "
+                         "summary CSV to PATH; legacy modes use long-format CSV")
     ap.add_argument("--estate", action="store_true",
                     help="compare workbooks across the folder: write an estate "
                          "report (estate.<format> + estate_pairs.csv) to the out dir, "
