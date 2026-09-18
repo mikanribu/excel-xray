@@ -8,55 +8,117 @@ Scans a complicated financial workbook and produces two things:
    (purpose, complexity, logic type, inputs, key findings, per-tab detail,
    duplication across a folder) — as an Excel report or local portfolio dashboard.
 
-Read-only. Never writes to, moves or renames a source file.
+The scanner reads source workbooks without changing them. It writes all results
+to a separate output folder.
+
+## Quick start: review a folder of EUCs
+
+Use Python 3.12 or newer and [uv](https://docs.astral.sh/uv/getting-started/installation/) on macOS, Linux,
+or Windows. These commands are for a macOS/Linux terminal; on Windows, run the
+equivalent commands in PowerShell and use the printed run-folder path in step 4.
+No API key or model service is needed for the default offline assessment.
+
+1. Get **this branch** and install its dependencies:
+
+   ```bash
+   git clone --branch codex/portfolio-dashboard-exports https://github.com/mikanribu/excel-xray.git
+   cd excel-xray
+   uv sync
+   ```
+
+2. Put the two (or more) `.xlsx`/`.xlsm` workbooks you want to review in a
+   folder such as `inputs/`. This folder is Git-ignored. For confidential
+   originals, you can instead pass an absolute path to a folder outside the
+   repository.
+
+   ```bash
+   mkdir -p inputs out
+   cp "/path/to/first.xlsx" "/path/to/second.xlsx" inputs/
+   ```
+
+   Replace the two example paths with the paths to your actual workbooks.
+   `inputs/` and `out/` are Git-ignored so local workbook contents and reports
+   are not included in a code commit.
+
+3. Scan the folder. The folder command produces **one portfolio run**, not one
+   JSON/report file per workbook:
+
+   ```bash
+   uv run excel-xray inputs/ -o out/
+   ```
+
+   The command prints `Portfolio ready: out/xray_<timestamp>_<suffix>`.
+   The suffix makes repeated runs unique. A run containing two workbooks has
+   two data rows in `file_summary.csv`, plus one header row.
+
+4. Open the dashboard. This selects the newest run under `out/`:
+
+   ```bash
+   RUN_DIR="$(ls -dt out/xray_* | head -n 1)"
+   uv run excel-xray serve "$RUN_DIR"
+   ```
+
+   Open the printed URL, normally <http://127.0.0.1:8765/>. Keep this terminal
+   running while using the dashboard; press `Ctrl+C` to stop it. If port 8765
+   is occupied, add `--port 8877` and open the URL printed for that port.
+
+5. In the dashboard, click a file name to inspect its assessment, worksheets,
+   cached-error diagnostics and hidden-sheet groups. Tick multiple files and
+   click **Compare selected** for a side-by-side view and structural matches.
+   Export buttons use the selected files; with none selected they export the
+   entire portfolio. **Review Excel** is the easiest file to send for review.
+   **Download original EUC** appears in a file's detail view. **Originals +
+   analysis ZIP** bundles source workbooks with their analysis.
+
+### What the run creates
+
+| File in `RUN_DIR` | Use |
+|---|---|
+| `portfolio_review.xlsx` | Shareable Excel review workbook: File summary, Worksheet details, Diagnostics, Portfolio findings |
+| `file_summary.csv` | One row per submitted EUC, including a failed-scan row where applicable |
+| `worksheet_details.csv` | One row per worksheet with visibility, role, dependencies and validation reason |
+| `diagnostics.csv` | Grouped cached errors and hidden-sheet purpose details |
+| `portfolio_findings.csv` | Findings consolidated across the EUCs in the run |
+| `portfolio.sqlite` | Indexed dashboard data; keep this file and the source workbooks available to use the dashboard later |
+
+The default folder run creates no per-file JSON or HTML reports. Individual
+HTML/Excel reports are generated on demand in the dashboard. To scan one
+workbook directly, use `uv run excel-xray file.xlsx -o out/`; it writes the
+existing individual Excel report. Add `--format html` for individual HTML.
+
+### Other commands
 
 ```bash
-uv run excel-xray file.xlsx -o out/            # individual Excel report
-uv run excel-xray /path/to/folder -o out/      # consolidated portfolio run
-uv run excel-xray serve out/xray_YYYYMMDD_HHMMSS  # localhost dashboard
-uv run excel-xray file.xlsx --assess           # EUC assessment as JSON to stdout
-uv run excel-xray /path/to/folder --csv euc.csv   # also copy one-row-per-EUC summary CSV
-uv run excel-xray /path/to/folder --estate -o out/   # compare EUCs across the estate
-uv run excel-xray file.xlsx --json             # raw structural scan as JSON
-uv run pytest                                  # accuracy + reader + assessment tests
+# Resume an interrupted portfolio run; unchanged files are reused and failures retried.
+uv run excel-xray inputs/ --resume "$RUN_DIR"
+
+# Also copy the consolidated, one-row-per-EUC CSV to a chosen location.
+uv run excel-xray inputs/ -o out/ --csv euc_summary.csv
+
+# Older one-report-per-workbook folder output, if specifically needed.
+uv run excel-xray inputs/ -o out/ --individual-reports
+
+# Raw structure or assessment JSON for a single workbook, printed to the terminal.
+uv run excel-xray file.xlsx --json
+uv run excel-xray file.xlsx --assess
 ```
 
-## Portfolio review for a folder of EUCs
+`--resume` must point to the **run folder** containing `portfolio.sqlite`, not
+the parent `out/` folder. The dashboard reads originals from their recorded
+source paths. If an original is moved or modified after scanning, resume the
+run from its current input folder before downloading that original or opening
+its on-demand report.
 
-Folder input now defaults to a consolidated run. A fresh `xray_<timestamp>`
-directory contains `portfolio.sqlite` (the single indexed assessment store),
-`file_summary.csv` (one row per submitted EUC, including failed scans),
-`worksheet_details.csv`, `diagnostics.csv`, `portfolio_findings.csv`, and
-`portfolio_review.xlsx` with corresponding worksheets. The review workbook's
-first sheet is the file-level summary. No per-file JSON or report files are
-generated for a folder. A single-file input still produces the existing
-individual Excel report; `--format html` produces the individual HTML report.
+The analysis exports contain structural evidence and assessment text, not raw
+cell values. The **original EUC download and ZIP do contain the source workbook
+bytes and cell values**; share them only with recipients cleared for those
+files. Generated output stays local and is not committed to GitHub.
 
-Start the dashboard with `excel-xray serve RUN_DIR` and open the printed local
-URL. It offers a paged file list, search, file and worksheet drill-down,
-portfolio findings, comparison of selected EUCs, and exports for the selected
-files (or all files if none are selected). The original EUC can be downloaded
-alone from its detail view, or with the selected analysis in a ZIP. The full
-individual HTML or Excel report is generated only when requested. The server
-binds to `127.0.0.1` by default.
-
-To recover from an interruption, run the same source folder with
-`--resume RUN_DIR`; unchanged successful files are reused and failures are
-retried. A changed source is rescanned. The originals remain at their source
-paths; moving or modifying them after a scan prevents original downloads and
-on-demand reports until the run is resumed. The ZIP contains the **actual
-workbook bytes**, including cell values; share it only with recipients cleared
-for those source files. The CSV, database, dashboard, and analysis Excel contain
-structural evidence and assessment text, not raw cell values.
-
-At 2,000 EUCs, the scan holds one workbook at a time. Cross-EUC comparison uses
-compact fingerprints retained in memory and performs pairwise comparisons;
-this is quadratic in file count, while stored output is limited to the 20
-strongest review matches per EUC. The dashboard recomputes similarity for
-selected files, so a pair remains comparable even if it was outside the
-stored shortlist. Use `--individual-reports` for the older one-report-per-file folder flow,
-or `--estate` for the original estate comparison. Those legacy modes retain
-their original batch-memory behaviour.
+At 2,000 EUCs, the portfolio scan holds one workbook at a time and keeps its
+assessments in one SQLite database. Cross-EUC comparison uses compact
+fingerprints and is quadratic in file count; only the 20 strongest review
+matches per EUC are stored. The dashboard recomputes selected-file similarity
+so selected pairs remain comparable even when outside that shortlist.
 
 ## Two layers
 
@@ -105,9 +167,9 @@ scan:
    cells/sec versus openpyxl's ~10k, with the whole workbook's formulas and
    values available at once.
 
-The scanner does not depend on openpyxl, but the Excel report writer does. Its cell reader is verified
-cell-for-cell against openpyxl on the fixture (values, formulas, bold, fill,
-border — zero mismatches); openpyxl is a test-only tool.
+The scanner does not depend on openpyxl, but the Excel report writer does. The
+scanner's cell reader is verified cell-for-cell against openpyxl on the fixture
+(values, formulas, bold, fill, border — zero mismatches).
 
 ## Architecture
 
@@ -123,6 +185,9 @@ Layers, deliberately separated.
 | [assessment.py](src/excel_xray/assessment.py) | Evidence → EUC schema: complexity, logic type, tab categories, dependencies, human-validation, heuristic findings |
 | [narrative.py](src/excel_xray/narrative.py) | Narrative fields behind an `Assessor` interface: offline template (default) or Claude (`--llm`) |
 | [corpus.py](src/excel_xray/corpus.py) | Per-file duplication/consolidation fields (formula shapes + headers) |
+| [portfolio.py](src/excel_xray/portfolio.py) | One-at-a-time folder scan, SQLite store, cross-EUC findings, consolidated CSV/Excel and selected bundles |
+| [portfolio_web.py](src/excel_xray/portfolio_web.py) | Local dashboard, drill-down, comparison and download routes |
+| [xlsx_report.py](src/excel_xray/xlsx_report.py) | Existing individual and estate Excel reports |
 | [estate.py](src/excel_xray/estate.py) | Estate comparison: four-signal fingerprints, relationship typing, clustering |
 | [estate_insight.py](src/excel_xray/estate_insight.py) | Interprets families → recommendations (offline template or Claude) |
 | [estate_report.py](src/excel_xray/estate_report.py) | Standalone estate HTML + pairs CSV |
@@ -202,8 +267,10 @@ holds for the estate insight layer's `ClaudeEstateAssessor` /
 
 ## Estate comparison
 
-`--estate` over a folder compares every workbook against every other on four
-independent signals and writes `estate.html` + `estate_pairs.csv`:
+`--estate` is the older, separate estate-analysis mode. Over a folder it
+compares every workbook against every other on four independent signals and
+writes `estate.xlsx` + `estate_pairs.csv` by default (use `--format html` for
+`estate.html`):
 
 | Signal | Captures | A match means |
 |---|---|---|
