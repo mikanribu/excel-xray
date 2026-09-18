@@ -128,6 +128,9 @@ Layers, deliberately separated.
 | [estate_report.py](src/excel_xray/estate_report.py) | Standalone estate HTML + pairs CSV |
 | [tabular.py](src/excel_xray/tabular.py) | The review-table schema; drives the HTML tables and the CSV export |
 | [report.py](src/excel_xray/report.py) | Self-contained HTML — no CDN, no network |
+| [xlsx_report.py](src/excel_xray/xlsx_report.py) | The default `.xlsx` report: one workbook per assessed file, plus the estate comparison sheet. Blank Reviewer Value/Notes columns for the human sign-off |
+| [portfolio.py](src/excel_xray/portfolio.py) | Bounded-memory folder scan for the consolidated portfolio run: `portfolio.sqlite` store, CSV/xlsx exports, `--resume` |
+| [portfolio_web.py](src/excel_xray/portfolio_web.py) | The `excel-xray serve` dashboard: a local-only HTTP server reading `portfolio.sqlite` for paged drill-down, search, comparison and on-demand exports |
 | [util.py](src/excel_xray/util.py) | A1-notation helpers (replaces `openpyxl.utils`) |
 
 ### The asymmetry that matters
@@ -168,19 +171,34 @@ for t in a.tabs:
 
 Purpose, Key Output/Outcome, Key Outputs and each tab's Purpose are written by an
 `Assessor`. The default is offline (network-free, `drafted`). Pass `--llm` to use
-Claude instead (`inferred`); this needs the optional `anthropic` package and a
-credential:
+a model instead (`inferred`); this needs the optional `anthropic` and/or `openai`
+package and a credential:
 
 ```bash
 uv sync --extra llm
 ANTHROPIC_API_KEY=sk-ant-... uv run excel-xray file.xlsx --assess --llm
 ```
 
-Or put the key in a `.env` file (copy [.env.example](.env.example) to `.env`) —
-with `--llm` the CLI loads it automatically. `.env` is git-ignored, so the key is
-never committed. The SDK also accepts an `ant auth login` profile if you have
-one. Only a **value-free structural bundle** (headers + normalised formula
-shapes, never cell values) is sent to the model.
+`--provider` chooses the backend: `claude` (Anthropic, the default) or `openai`
+(the public OpenAI API, or an Azure OpenAI deployment once `--azure-endpoint` /
+`$AZURE_OPENAI_ENDPOINT` is set — which also implies `--provider openai`).
+`--model` overrides the per-provider default model (Claude: `$ANTHROPIC_MODEL`
+or `claude-opus-5`; OpenAI: `$OPENAI_MODEL` or `gpt-4o`; Azure: the deployment
+name, from `$AZURE_OPENAI_DEPLOYMENT` or `--model`).
+
+```bash
+OPENAI_API_KEY=sk-... uv run excel-xray file.xlsx --assess --llm --provider openai
+AZURE_OPENAI_API_KEY=... uv run excel-xray file.xlsx --assess --llm \
+  --azure-endpoint https://<resource>.openai.azure.com --model <deployment-name>
+```
+
+Or put credentials in a `.env` file (copy [.env.example](.env.example) to
+`.env`) — with `--llm` the CLI loads it automatically. `.env` is git-ignored, so
+keys are never committed. The Claude path also accepts an `ant auth login`
+profile if you have one. Only a **value-free structural bundle** (headers +
+normalised formula shapes, never cell values) is sent to the model — the same
+holds for the estate insight layer's `ClaudeEstateAssessor` /
+`OpenAIEstateAssessor` below.
 
 ## Estate comparison
 
@@ -205,8 +223,9 @@ the per-signal breakdown for each pair.
 (reproducible and auditable). On top of them an *insight* layer interprets each
 family — what it is, and a recommended action (consolidate / keep one / extract
 shared logic / align source) — plus a ranked estate-level opportunities list. It
-runs offline by default (basis `drafted`) and upgrades to Claude with `--llm`
-(basis `inferred`); only fingerprint metadata is sent, never cell values.
+runs offline by default (basis `drafted`) and upgrades to a model with `--llm`
+(basis `inferred`, same `--provider`/`--model` choice as above); only
+fingerprint metadata is sent, never cell values.
 
 ```python
 from excel_xray import xray_workbook, assess, build_estate
@@ -245,7 +264,7 @@ accuracy.
 ```bash
 uv sync                      # runtime deps: lxml and openpyxl
 uv sync --extra encrypted    # + olefile, to name encrypted files in triage
-uv sync --extra llm          # + anthropic, for the --llm narrative assessor
+uv sync --extra llm          # + anthropic, openai, python-dotenv, for --llm
 ```
 
 ## Known limits
