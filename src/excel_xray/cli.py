@@ -31,6 +31,7 @@ from .assessment import assess
 from .assessment import to_dict as assessment_to_dict
 from .report import write_report
 from .scan import UnreadableWorkbook, to_json, xray_workbook
+from .emailing import DEFAULT_RECIPIENT, EmailDeliveryError, send_excel_report
 
 EXTS = {".xlsx", ".xlsm", ".xltx", ".xltm"}
 SKIP_PREFIX = ("~$", ".")
@@ -141,7 +142,24 @@ def main() -> int:
                     help="for a folder, retain the legacy one-report-per-EUC output")
     ap.add_argument("--resume", metavar="RUN_DIR", default=None,
                     help="resume a portfolio run, reusing unchanged scanned EUCs")
+    ap.add_argument("--email-report", action="store_true",
+                    help="email the generated Excel report to --email-to (opt-in; "
+                         "requires GMAIL_ADDRESS and GMAIL_APP_PASSWORD)")
+    ap.add_argument("--email-to", default=DEFAULT_RECIPIENT, metavar="ADDRESS",
+                    help=f"report recipient when --email-report is used "
+                         f"(default: {DEFAULT_RECIPIENT})")
     args = ap.parse_args()
+
+    if args.email_report:
+        if args.json or args.assess:
+            ap.error("--email-report requires an Excel report; it cannot be combined with --json or --assess")
+        if args.format != "xlsx":
+            ap.error("--email-report requires --format xlsx")
+        if os.path.isdir(args.target) and (args.individual_reports or args.estate):
+            ap.error("--email-report for folders requires the consolidated portfolio run; "
+                     "remove --individual-reports and --estate")
+    elif args.email_to != DEFAULT_RECIPIENT:
+        ap.error("--email-to can only be used with --email-report")
 
     if args.llm:
         # Load a local .env so ANTHROPIC_API_KEY / OPENAI_API_KEY /
@@ -188,6 +206,14 @@ def main() -> int:
         print(f"Portfolio ready: {run_dir} ({result['stored']} EUCs; "
               f"{result['failed']} failed; {result['reused']} reused)", file=sys.stderr)
         print(f"Open with: excel-xray serve '{run_dir}'", file=sys.stderr)
+        if args.email_report:
+            try:
+                report_path = os.path.join(run_dir, "portfolio_review.xlsx")
+                send_excel_report(report_path, recipient=args.email_to)
+            except EmailDeliveryError as exc:
+                print(f"email failed: {exc}", file=sys.stderr)
+                return 1
+            print(f"Emailed {os.path.basename(report_path)} to {args.email_to}", file=sys.stderr)
         return 0
 
     base_outdir = args.out or (args.target if os.path.isdir(args.target)
@@ -205,6 +231,7 @@ def main() -> int:
     ok = partial = failed = 0
     reasons: dict[str, list[str]] = {}
     batch: list = []  # (path, wx) for assessment-aware output modes
+    generated_reports: list[str] = []
     timings: dict[str, float] = {}  # path -> extraction seconds, for the report line below
     for p in paths:
         t0 = time.perf_counter()
@@ -274,6 +301,7 @@ def main() -> int:
             if args.format == "xlsx":
                 from .xlsx_report import write_xlsx_report
                 write_xlsx_report(wx, a, dest, estate=estate, estate_insight=insight)
+                generated_reports.append(dest)
             else:
                 write_report(wx, dest, a)
             regions = sum(len(s.regions) for s in wx.sheets)
@@ -310,6 +338,18 @@ def main() -> int:
     for cat, files in sorted(reasons.items()):
         print(f"  {cat:12} {len(files):3}  {', '.join(files[:4])}"
               + (" ..." if len(files) > 4 else ""), file=sys.stderr)
+    if args.email_report:
+        if len(generated_reports) != 1:
+            print("email failed: expected exactly one generated Excel report, "
+                  f"found {len(generated_reports)}", file=sys.stderr)
+            return 1
+        try:
+            send_excel_report(generated_reports[0], recipient=args.email_to)
+        except EmailDeliveryError as exc:
+            print(f"email failed: {exc}", file=sys.stderr)
+            return 1
+        print(f"Emailed {os.path.basename(generated_reports[0])} to {args.email_to}",
+              file=sys.stderr)
     return 0
 
 

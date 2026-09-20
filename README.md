@@ -70,6 +70,40 @@ No API key or model service is needed for the default offline assessment.
    **Download original EUC** appears in a file's detail view. **Originals +
    analysis ZIP** bundles source workbooks with their analysis.
 
+### Email the Excel report
+
+Email delivery is opt-in. A folder scan sends the single consolidated
+`portfolio_review.xlsx`; a one-workbook scan sends its generated Excel report.
+It never sends one message per EUC. The default recipient is
+`jacobweglarz@gmail.com`, and `--email-to` can override it.
+
+Set `GMAIL_ADDRESS` to the Gmail account that will send the report and
+`GMAIL_APP_PASSWORD` to an [App Password](https://support.google.com/accounts/answer/2461835)
+created for that account. Google requires 2-Step Verification for App Passwords.
+Use an App Password instead of your normal Google password, and keep it in your
+shell environment or a local secret manager; do not commit it to the repository.
+The sender uses Gmail's encrypted SMTP service at `smtp.gmail.com`.
+
+```bash
+export GMAIL_ADDRESS="your-sender@gmail.com"
+export GMAIL_APP_PASSWORD="your-16-character-app-password"
+
+# One message with the consolidated workbook for the whole folder
+uv run excel-xray inputs/ -o out/ --email-report
+
+# Send to a different reviewer
+uv run excel-xray inputs/ -o out/ --email-report --email-to reviewer@example.com
+
+# One workbook: send its individual Excel report
+uv run excel-xray "inputs/one-euc.xlsx" -o out/ --email-report
+```
+
+The report is generated locally even if email delivery fails; the command then
+prints the delivery error and exits nonzero so the send can be retried. Reports
+larger than 17 MiB are kept locally and not attached, to leave room for email
+attachment encoding. The workbook contains analysis for every EUC in the folder,
+so check that the recipient is cleared to review it before enabling delivery.
+
 ### What the run creates
 
 | File in `RUN_DIR` | Use |
