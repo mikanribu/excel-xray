@@ -23,6 +23,7 @@ from .assessment import assess, to_dict
 from .corpus import DUP_THRESHOLD, SIMILAR_THRESHOLD, SKELETON_DUP, Fingerprint, fingerprint, similarity
 from .scan import xray_workbook
 from .tabular import FILE_FIELDS, TAB_FIELDS, fmt_value
+from .util import safe_scan_message
 
 DB_NAME = "portfolio.sqlite"
 SUMMARY_NAME = "file_summary.csv"
@@ -31,8 +32,8 @@ SHEET_NAME = "worksheet_details.csv"
 FINDINGS_NAME = "portfolio_findings.csv"
 DIAGNOSTICS_NAME = "diagnostics.csv"
 
-SUMMARY_COLUMNS = ["Record ID", "File ID", "File Name", "Source Path", "Scan Status",
-                   "Scan Error", "Size Bytes", "SHA256", "Sheets", "Hidden Sheets",
+SUMMARY_COLUMNS = ["Record ID", "File ID", "File Name", "Scan Status", "Scan Error",
+                   "No. of Sheets - Total", "No. of Sheets - Hidden",
                    "Cached Errors", "Tabs Requiring Review"] + [label for _, _, label in FILE_FIELDS
                                                                if label not in {"File ID", "File Name"}]
 TAB_COLUMNS = ["Record ID", "File ID", "File Name", "Tab Name", "Original Position"] + [
@@ -99,13 +100,18 @@ def _json(value) -> str:
     return json.dumps(value, ensure_ascii=False, default=str)
 
 
+def _safe_scan_error(exc: Exception, path: str) -> str:
+    """Keep actionable scan status while removing machine-specific paths."""
+    message = safe_scan_message(exc, path)
+    return f"{getattr(exc, 'category', type(exc).__name__)}: {message}".strip()
+
+
 def _store_failure(db: sqlite3.Connection, path: str, exc: Exception) -> None:
     try:
         st = os.stat(path)
         size, mtime = st.st_size, st.st_mtime_ns
     except OSError:
         size, mtime = None, None
-    category = getattr(exc, "category", type(exc).__name__)
     db.execute("""INSERT INTO files(source_path,file_name,size_bytes,source_mtime_ns,scan_status,scan_error)
         VALUES(?,?,?,?,?,?) ON CONFLICT(source_path) DO UPDATE SET
         size_bytes=excluded.size_bytes,source_mtime_ns=excluded.source_mtime_ns,
@@ -113,7 +119,7 @@ def _store_failure(db: sqlite3.Connection, path: str, exc: Exception) -> None:
         file_id=NULL,sha256=NULL,sheet_count=0,hidden_count=0,
         cached_error_count=0,review_count=0,
         summary_json=NULL,assessment_json=NULL,fingerprint_json=NULL""",
-        (path, os.path.basename(path), size, mtime, "failed", f"{category}: {exc}"))
+        (path, os.path.basename(path), size, mtime, "failed", _safe_scan_error(exc, path)))
     pk = db.execute("SELECT id FROM files WHERE source_path=?", (path,)).fetchone()[0]
     for table in ("tabs", "errors", "hidden_groups"):
         db.execute(f"DELETE FROM {table} WHERE file_pk=?", (pk,))
@@ -125,18 +131,22 @@ def _store_success(db: sqlite3.Connection, path: str, wx, a) -> None:
                for _, attr, label in FILE_FIELDS}
     fp = fingerprint(wx, a)
     hidden = a.review.hidden_summary
+    scan_error = None
+    if wx.parse_status == "partial":
+        details = "; ".join(wx.warnings[:3]) or "Workbook scan incomplete; review diagnostics"
+        scan_error = "Partial: " + safe_scan_message(details, path)
     db.execute("""INSERT INTO files(source_path,file_id,file_name,size_bytes,source_mtime_ns,sha256,
         scan_status,scan_error,sheet_count,hidden_count,cached_error_count,review_count,
         summary_json,assessment_json,fingerprint_json)
         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(source_path) DO UPDATE SET
         file_id=excluded.file_id,file_name=excluded.file_name,size_bytes=excluded.size_bytes,
         source_mtime_ns=excluded.source_mtime_ns,sha256=excluded.sha256,
-        scan_status=excluded.scan_status,scan_error=NULL,sheet_count=excluded.sheet_count,
+        scan_status=excluded.scan_status,scan_error=excluded.scan_error,sheet_count=excluded.sheet_count,
         hidden_count=excluded.hidden_count,cached_error_count=excluded.cached_error_count,
         review_count=excluded.review_count,summary_json=excluded.summary_json,
         assessment_json=excluded.assessment_json,fingerprint_json=excluded.fingerprint_json""",
         (path, a.file.file_id.value, wx.filename, st.st_size, st.st_mtime_ns,
-         wx.sha256, wx.parse_status, None, len(wx.sheets), hidden.get("hidden_count", 0),
+         wx.sha256, wx.parse_status, scan_error, len(wx.sheets), hidden.get("hidden_count", 0),
          sum(g.count for g in a.review.error_groups),
          sum(t.human_validation_required.value == "Y" for t in a.tabs),
          _json(summary), _json(to_dict(a)), _json({
@@ -381,10 +391,10 @@ def _safe(value):
 def summary_rows(db, ids=None):
     for r in selected_files(db, ids):
         summary = json.loads(r["summary_json"]) if r["summary_json"] else {}
-        values = [r["id"], r["file_id"], r["file_name"], r["source_path"],
-                  r["scan_status"], r["scan_error"], r["size_bytes"], r["sha256"],
-                  r["sheet_count"], r["hidden_count"], r["cached_error_count"], r["review_count"]]
-        yield [_safe(v) for v in values + [summary.get(c, "") for c in SUMMARY_COLUMNS[12:]]]
+        values = [r["id"], r["file_id"], r["file_name"], r["scan_status"],
+                  r["scan_error"], r["sheet_count"], r["hidden_count"],
+                  r["cached_error_count"], r["review_count"]]
+        yield [_safe(v) for v in values + [summary.get(c, "") for c in SUMMARY_COLUMNS[9:]]]
 
 
 def tab_detail_rows(db, ids=None):
@@ -589,4 +599,5 @@ def assessment_from_json(raw: str):
     review["error_groups"] = [ErrorGroup(**g) for g in review["error_groups"]]
     review["hidden_summary"]["groups"] = [HiddenGroup(**g)
                                            for g in review["hidden_summary"].get("groups", [])]
-    return Assessment(file=file_assessment, tabs=tabs, review=ReviewFindings(**review))
+    return Assessment(file=file_assessment, tabs=tabs, review=ReviewFindings(**review),
+                      scan=d.get("scan", {}))

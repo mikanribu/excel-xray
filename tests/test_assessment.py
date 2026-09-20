@@ -40,16 +40,12 @@ def test_logic_type_is_calculation(xray):
     assert fa.logic_type.value == "Calculation"
 
 
-def test_manual_intervention_flags_hardcoded_inputs(xray):
+def test_manual_intervention_is_left_for_the_process_owner(xray):
     fa = assess(xray).file
-    # No High/Medium/Low from a non-formula-cell percentage any more: either a
-    # concrete per-tab manual-entry finding, or needs_human with a question.
-    assert fa.manual_intervention.basis in {"derived", "needs_human"}
-    if fa.manual_intervention.basis == "derived":
-        assert isinstance(fa.manual_intervention.value, dict)
-        assert any("hardcoded" in v for v in fa.manual_intervention.value.values())
-    else:
-        assert any("reviewer question" in e for e in fa.manual_intervention.evidence)
+    assert fa.manual_intervention.basis == "needs_human"
+    assert fa.manual_intervention.value == (
+        "Not established — confirm which inputs are keyed, pasted, adjusted or overridden, by whom and how often."
+    )
 
 
 def test_deferred_fields_carry_intended_basis(xray):
@@ -65,7 +61,8 @@ def test_deferred_fields_carry_intended_basis(xray):
 def test_key_calculations_extracted(xray):
     fa = assess(xray).file
     assert fa.key_calculations_logic.basis == "extracted"
-    assert fa.key_calculations_logic.value["top_functions"]
+    assert fa.key_calculations_logic.value["business_descriptions"]
+    assert "top_functions" not in fa.key_calculations_logic.value
 
 
 # --------------------------------------------------------------- tab level
@@ -127,7 +124,7 @@ def test_simplification_flags_hardcodes_and_hidden_sheet(xray):
     fa = assess(xray).file
     sf = fa.potential_simplification
     assert sf.basis == "derived"
-    assert sf.value["verdict"] == "Yes"
+    assert "Potential simplification" in sf.value["verdict"]
     candidates = sf.value["candidates"]
     assert candidates
     for c in candidates:
@@ -141,11 +138,11 @@ def test_automation_is_a_candidate(xray):
     fa = assess(xray).file
     au = fa.potential_automation
     assert au.basis == "derived"
-    assert au.value["verdict"] in {"Yes", "Possibly"}
     candidates = au.value["candidates"]
-    assert candidates
     for c in candidates:
-        assert c["verdict"] in {"Candidate", "Candidate — workflow confirmation required"}
+        assert c["verdict"] == "Potential workflow lead — owner confirmation required"
+        assert c["requires_human_confirmation"] is True
+    assert len(candidates) < 5  # do not turn every worksheet into an automation lead
 
 
 def test_retirement_never_inferred_from_hidden_or_age(xray):
@@ -154,7 +151,7 @@ def test_retirement_never_inferred_from_hidden_or_age(xray):
     fa = assess(xray).file
     rt = fa.potential_retirement
     assert rt.basis == "needs_human"
-    assert rt.value["verdict"] == "Not established — owner decision required."
+    assert rt.value["verdict"] == "Not established — confirm with the process owner."
     assert set(rt.value["confirmation_needed"]) >= {"active usage", "owner"}
 
 
@@ -195,7 +192,7 @@ def test_offline_narrative_is_drafted_and_grounded(xray):
     # Default assessor is the offline stub — no network, basis "drafted".
     fa = assess(xray).file
     assert fa.purpose_of_file.basis == "drafted"
-    assert fa.purpose_of_file.value and "calculation" in fa.purpose_of_file.value.lower()
+    assert fa.purpose_of_file.value.startswith("Not established — confirm")
     # key_outputs is deterministic (Step 12): final deliverables vs supporting/
     # intermediate/input/mapping tabs, not narrative-supplied.
     assert fa.key_outputs.basis == "derived"
@@ -245,3 +242,42 @@ def test_bundle_carries_no_cell_values(xray):
     blob = json.dumps(bundle)
     # A distinctive cached figure from Calc!C5 must not appear.
     assert "59937" not in blob
+
+
+def test_process_classification_requires_specific_matching_evidence(xray):
+    from excel_xray.narrative import Narrative
+
+    class Unsupported:
+        basis = "inferred"
+        label = "fake model"
+        def narrate(self, bundle):
+            return Narrative(process="Claims", sub_process="Claim payment",
+                            process_evidence=["Calculation"],
+                            sub_process_evidence=["Input"])
+
+    a = assess(xray, assessor=Unsupported())
+    assert a.file.process.basis == "needs_human"
+    assert a.file.sub_process.basis == "needs_human"
+    assert a.file.process.value.startswith("Not established")
+
+
+def test_scan_metadata_and_logic_taxonomy_export_once(xray):
+    from excel_xray.assessment import to_dict
+    from excel_xray.tabular import FILE_FIELDS
+
+    a = assess(xray)
+    exported = to_dict(a)
+    assert exported["scan"]["status"] in {"full", "partial"}
+    assert exported["scan"]["total_sheets"] == len(xray.sheets)
+    assert "logic_type" not in exported["file"]
+    serialized = json.dumps(exported)
+    assert "source_path" not in serialized
+    assert "full_path_evidence" not in serialized
+    assert "sha256" not in serialized
+    labels = [label for _, _, label in FILE_FIELDS]
+    assert labels.count("Logic Types") == 1
+    assert "Logic Type" not in labels
+    assert set(a.file.logic_types.value) <= {
+        "Calculation", "Reporting", "Data Transformation",
+        "Reconciliation / Control", "Manual Input", "Other",
+    }

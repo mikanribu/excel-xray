@@ -16,6 +16,8 @@ FILE_FIELDS = [
     ("Fact Assessment", "file_id", "File ID"),
     ("Fact Assessment", "file_name", "File Name"),
     ("Fact Assessment", "business_area_process", "Business Area / Process"),
+    ("Fact Assessment", "process", "Process"),
+    ("Fact Assessment", "sub_process", "Sub-Process"),
     ("Fact Assessment", "purpose_of_file", "Purpose of File"),
     ("Fact Assessment", "key_output_outcome", "Key Output / Outcome"),
     ("Fact Assessment", "complexity", "Complexity"),
@@ -32,7 +34,6 @@ FILE_FIELDS = [
     ("Key AI Finding / Observation", "potential_consolidation", "Potential Consolidation"),
     ("Key AI Finding / Observation", "potential_automation", "Potential Automation"),
     ("Key AI Finding / Observation", "potential_retirement", "Potential Retirement"),
-    ("Workbook logic / Automation", "logic_type", "Logic Type"),
     ("Workbook logic / Automation", "logic_types", "Logic Types"),
     ("Workbook logic / Automation", "key_calculations_logic", "Key calculations / logic"),
     ("Workbook logic / Automation", "reconciliation_logic", "Reconciliation logic"),
@@ -76,36 +77,58 @@ def fmt_value(v) -> str:
                     extras.append(f"{k}: " + ", ".join(vals))
             s = str(v["verdict"])
             return s + (" — " + "; ".join(extras) if extras else "")
-        if "top_functions" in v:  # key_calculations_logic
-            fns = ", ".join(v.get("top_functions", []))
-            shapes = "; ".join(v.get("top_formula_shapes", [])[:3])
-            desc = v.get("business_description")
-            descs = "; ".join(v.get("business_descriptions", []) or ([desc] if desc else []))
-            return " | ".join(p for p in (descs, fns, shapes) if p) or "—"
+        if "business_descriptions" in v or "business_description" in v:
+            descs = v.get("business_descriptions") or [v.get("business_description")]
+            return "; ".join(str(d) for d in descs if d) or "Not established — confirm with process owner"
         if "in_workbook" in v:  # tab downstream_dependencies
             items = v.get("in_workbook") or []
             return "; ".join(_candidate_label(x) for x in items) or "—"
         if "final_business_deliverables" in v:  # file key_outputs
-            return "; ".join(f"{k}: {', '.join(vals)}" for k, vals in v.items() if vals) or "—"
+            vals = v.get("final_business_deliverables") or []
+            return "; ".join(vals) if vals else v.get(
+                "status", "Not established — confirm the final business deliverable with the process owner")
         if "vba" in v:  # macros_vba_external_links
             vba = v.get("vba", {})
-            parts = [f"VBA: {'yes — ' + ', '.join(vba.get('modules', [])) if vba.get('present') else 'no'}",
-                    f"Power Query: {'yes' if v.get('power_query') else 'no'}",
-                    f"connections: {', '.join(v.get('data_connections', []) or ['none'])}",
-                    f"external links: {v.get('external_workbook_links', 0)}"]
+            formal = v.get("formal_data_connections", {})
+            count = formal.get("count", 0)
+            parts = [f"VBA: {'present' if vba.get('present') else 'none detected'}",
+                    f"Power Query: {'present' if v.get('power_query') else 'none detected'}",
+                    f"Formal data connections: {count} detected" if count else "Formal data connections: none detected",
+                    f"External workbook links: {v.get('external_workbook_links', 0)} reference(s)"]
             return "; ".join(parts)
-        if "resolved" in v or "reviewer_questions" in v:  # reconciliation_logic
-            parts = [f"{d['tab']}: {d.get('source','?')} vs {d.get('comparison_target','?')} "
-                    f"on {d.get('matching_key','?')}" for d in v.get("resolved", [])]
+        if "resolved" in v or "reviewer_questions" in v or "candidates" in v:  # reconciliation_logic
+            parts = [f"{d['tab']}: {d.get('status')}; source={d.get('source')}; "
+                     f"target={d.get('comparison_target')}; key={d.get('matching_key')}; "
+                     f"agreement={d.get('agreement_evidence')}"
+                     for d in v.get("candidates", []) + v.get("resolved", [])]
             parts += v.get("reviewer_questions", [])
             return "; ".join(parts) or "—"
         if "in_workbook_sheets" in v:  # key_inputs / upstream_dependencies grouped
+            if v.get("source_details"):
+                return "; ".join(
+                    f"{item.get('business_purpose')}: {item.get('source_type')} "
+                    f"{item.get('source_name')} ({item.get('reference_count', 0)} reference(s)); "
+                    f"consumers: {item.get('consuming_worksheets')}; "
+                    f"status: {item.get('source_status')}; essentiality: {item.get('essentiality')}"
+                    for item in v["source_details"]
+                ) or "No input sources identified"
             parts = []
             for k in ("in_workbook_sheets", "lookup_mapping_tables", "data_connections",
-                     "external_workbooks", "other_unresolved_sources"):
+                     "other_unresolved_sources"):
                 items = v.get(k)
                 if items and items not in (["none"], []):
                     parts.append(f"{k}: " + ", ".join(_candidate_label(x) for x in items))
+            for group in v.get("external_workbooks") or []:
+                if isinstance(group, dict):
+                    files = group.get("files") or []
+                    names = ", ".join(
+                        f"{x.get('file_name')} ({x.get('reference_count', 1)} reference(s))"
+                        for x in files if isinstance(x, dict)
+                    )
+                    parts.append(f"{group.get('business_purpose', 'External source')}: "
+                                 f"{names or 'none'}; consumers: "
+                                 f"{group.get('consuming_worksheets', 'not established')}; "
+                                 f"essentiality: {group.get('essentiality', 'not established')}")
             return "; ".join(parts) or "—"
         return json.dumps(v, default=str)
     return str(v)

@@ -160,22 +160,27 @@ def _formula_patterns_sheet(wb: Workbook, wx) -> None:
 def _warnings_sheet(wb: Workbook, wx) -> None:
     ws = _new_sheet(wb, "Warnings")
     _header_row(ws, ["Warning"])
-    _write_rows(ws, [[w] for w in wx.warnings] or [["none"]], wrap_cols={1})
+    from .util import safe_scan_message
+    _write_rows(ws, [[safe_scan_message(w, wx.path)] for w in wx.warnings] or [["none"]], wrap_cols={1})
     _widths(ws, [110])
 
 
 def _report_info_sheet(wb: Workbook, wx) -> None:
     ws = _new_sheet(wb, "Report information")
     _header_row(ws, ["Field", "Value"])
+    from .util import safe_scan_message
+    scan_error = (safe_scan_message("; ".join(wx.warnings[:3]) or
+                                    "Workbook scan was partial; review diagnostics.", wx.path)
+                  if wx.parse_status == "partial" else "—")
     rows = [
         ["File name", wx.filename],
-        ["Content hash (sha256, first 16)", wx.sha256[:16]],
-        ["Size (bytes)", wx.size_bytes],
+        ["Scan status", wx.parse_status],
+        ["Scan error", scan_error],
+        ["No. of Sheets - Total", len(wx.sheets)],
+        ["No. of Sheets - Hidden", sum(s.state != "visible" for s in wx.sheets)],
         ["Filesystem modified", wx.fs_modified],
         ["Document last modified", (wx.core_props or {}).get("modified")],
         ["Last saved by application", (wx.app_props or {}).get("application")],
-        ["Parse status", wx.parse_status],
-        ["Sheet count", len(wx.sheets)],
         ["Report generated", _dt.datetime.now().isoformat(timespec="seconds")],
     ]
     _write_rows(ws, rows, wrap_cols={2})
@@ -230,67 +235,60 @@ def _hidden_groups_sheet(wb: Workbook, review) -> None:
 
 def _input_sources_sheet(wb: Workbook, grouped: dict) -> None:
     ws = _new_sheet(wb, "Input sources")
-    headers = ["Category", "Item", "Detail", "Essentiality"]
+    headers = ["Business purpose", "Source type", "Source name", "Reference count",
+              "Consuming worksheets", "Source status", "Essentiality"]
     _header_row(ws, headers)
-    rows = []
-    for name in grouped.get("in_workbook_sheets", []) or []:
-        rows.append(["In-workbook sheet", name, "", "confirmed — read by another tab"])
-    for name in grouped.get("lookup_mapping_tables", []) or []:
-        rows.append(["Lookup / mapping table", name, "", "confirmed — mapping role detected"])
-    for c in grouped.get("data_connections", []) or []:
-        if isinstance(c, dict):
-            rows.append(["Data connection", c.get("name", "unnamed"), c.get("type") or "", "requires review"])
-    for ext in grouped.get("external_workbooks", []) or []:
-        if isinstance(ext, dict):
-            for f in ext.get("files", []):
-                rows.append([f"External workbook — {ext['purpose']}", f["file_name"],
-                            f.get("full_path_evidence") or "", ext.get("essentiality", "requires review")])
-    for other in grouped.get("other_unresolved_sources", []) or []:
-        if other != "none":
-            rows.append(["Other unresolved source", other, "", "requires review"])
+    rows = [[item.get("business_purpose"), item.get("source_type"),
+             item.get("source_name"), item.get("reference_count"),
+             _join(item.get("consuming_worksheets")),
+             item.get("source_status"), item.get("essentiality")]
+            for item in grouped.get("source_details", [])]
     if not rows:
-        rows = [["—", "no inputs identified", "", ""]]
-    _write_rows(ws, rows, wrap_cols={2, 3})
-    _widths(ws, [30, 40, 55, 30])
+        rows = [["—", "—", "no inputs identified", "", "", "", ""]]
+    _write_rows(ws, rows, wrap_cols=set(range(1, len(headers) + 1)))
+    _widths(ws, [35, 28, 40, 16, 42, 48, 42])
 
 
 def _calculation_steps_sheet(wb: Workbook, assessment) -> None:
     ws = _new_sheet(wb, "Calculation steps")
-    headers = ["Tab", "Business description", "Top functions", "Top formula shapes"]
+    headers = ["Worksheet", "Business calculation or transformation"]
     _header_row(ws, headers)
     rows = []
     for ta in assessment.tabs:
         kc = ta.key_calculation_transformation_logic.value
-        if not isinstance(kc, dict) or not kc.get("top_functions"):
+        if not isinstance(kc, dict) or not (kc.get("business_description") or kc.get("business_descriptions")):
             continue
-        rows.append([ta.tab_name.value, kc.get("business_description") or "—",
-                    _join(kc.get("top_functions", [])), _join(kc.get("top_formula_shapes", []))])
+        description = kc.get("business_description") or "; ".join(kc.get("business_descriptions", []))
+        rows.append([ta.tab_name.value, description])
     if not rows:
-        rows = [["—", "workbook has no formulas", "", ""]]
-    _write_rows(ws, rows, wrap_cols={2, 3, 4})
-    _widths(ws, [22, 55, 40, 55])
+        rows = [["—", "No business calculation summary established from workbook structure."]]
+    _write_rows(ws, rows, wrap_cols={2})
+    _widths(ws, [28, 90])
 
 
 def _review_opportunities_sheet(wb: Workbook, assessment) -> None:
     ws = _new_sheet(wb, "Review opportunities")
-    headers = ["Kind", "Worksheet", "Detail", "Proposed action / question",
+    headers = ["Kind", "Process", "Sub-Process", "Worksheet", "Detail", "Proposed action / question",
               "Requires human confirmation", "Reviewer Value", "Reviewer Notes"]
     _header_row(ws, headers)
     rows = []
     for c in assessment.review.simplification_candidates:
-        rows.append(["Simplification", c["worksheet"], c["current_complexity"],
-                    c["proposed_change"], "Yes", None, None])
+        rows.append(["Simplification", c.get("process"), c.get("sub_process"), c["worksheet"],
+                    c["current_complexity"], c["proposed_change"], "Yes", None, None])
     for c in assessment.review.automation_candidates:
-        detail = c.get("suspected_manual_step", "")
-        rows.append(["Automation", c["worksheet"], detail, c["verdict"], "Yes", None, None])
+        detail = c.get("observed_manual_step", "Not established — confirm with process owner")
+        rows.append(["Automation", c.get("process"), c.get("sub_process"), c["worksheet"],
+                    detail, c.get("candidate_action", c["verdict"]), "Yes", None, None])
     for ta in assessment.tabs:
         if ta.human_validation_required.value == "Y":
             for reason in ta.validation_reason.value:
-                rows.append(["Validation", ta.tab_name.value, "", reason, "Yes", None, None])
+                rows.append(["Validation", "Not established", "Not established",
+                             ta.tab_name.value, "", reason, "Yes", None, None])
     if not rows:
-        rows = [["—", "—", "no material review opportunities identified", "", "", None, None]]
-    _write_rows(ws, rows, wrap_cols={3, 4, 6, 7})
-    _widths(ws, [16, 22, 40, 55, 14, 24, 32])
+        rows = [["—", "Not established", "Not established", "—",
+                 "no material review opportunities identified", "", "", None, None]]
+    _write_rows(ws, rows, wrap_cols={2, 3, 5, 6, 8, 9})
+    _widths(ws, [16, 38, 38, 24, 50, 65, 27, 20, 35])
 
 
 def _estate_sheet(wb: Workbook, estate, insight=None) -> None:

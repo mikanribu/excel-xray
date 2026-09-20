@@ -38,6 +38,25 @@ def test_assessment_sheets_are_filterable_and_frozen(xray):
     assert ws.freeze_panes == "A2"
 
 
+def test_reviewer_export_has_business_summary_and_keeps_formula_details_in_appendix(xray):
+    wb = build_xlsx_report(xray, assess(xray))
+    file_fields = [row[1].value for row in wb["File assessment"].iter_rows(min_row=2)]
+    assert "Logic Types" in file_fields
+    assert "Logic Type" not in file_fields
+    info = " ".join(str(c.value) for row in wb["Report information"].iter_rows() for c in row)
+    assert "Scan status" in info and "No. of Sheets - Total" in info
+    assert "SHA256" not in info and "Content hash" not in info and "Size (bytes)" not in info
+    calc_headers = [c.value for c in next(wb["Calculation steps"].iter_rows(min_row=1, max_row=1))]
+    assert calc_headers == ["Worksheet", "Business calculation or transformation"]
+    input_headers = [c.value for c in next(wb["Input sources"].iter_rows(min_row=1, max_row=1))]
+    assert input_headers == ["Business purpose", "Source type", "Source name", "Reference count",
+                             "Consuming worksheets", "Source status", "Essentiality"]
+    all_values = " ".join(str(c.value) for ws in wb.worksheets for row in ws.iter_rows() for c in row)
+    assert xray.path not in all_values
+    assert "full_path_evidence" not in all_values
+    assert "Top formula shapes" in [c.value for c in next(wb["Formula patterns"].iter_rows(min_row=1, max_row=1))]
+
+
 def test_error_summary_sheet_has_grouped_and_detail_blocks(xray):
     wb = build_xlsx_report(xray, assess(xray))
     ws = wb["Error summary"]

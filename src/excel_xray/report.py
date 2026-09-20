@@ -12,6 +12,7 @@ from dataclasses import asdict
 
 from .scan import WorkbookXray
 from .tabular import FILE_FIELDS, TAB_FIELDS, file_rows, tab_rows
+from .util import safe_scan_message
 
 BASIS_COLOR = {
     "extracted": "#167B75",
@@ -465,8 +466,7 @@ def build_report(wx: WorkbookXray, assessment=None) -> str:
 
     A("<header class='top'><div class='eyebrow'>Workbook X-ray &middot; structural scan</div>"
       f"<h1>{_esc(wx.filename)}</h1>"
-      f"<div class='meta mono'>{_esc(wx.sha256[:16])}&hellip; &middot; "
-      f"{wx.size_bytes:,} bytes &middot; modified {_esc(wx.fs_modified)} &middot; "
+      f"<div class='meta'>Scan status: {_esc(wx.parse_status)} &middot; "
       f"last saved by {_esc((wx.app_props or {}).get('application') or 'unknown')}</div>")
 
     need_review = (sum(1 for t in assessment.tabs if t.human_validation_required.value == "Y")
@@ -484,7 +484,7 @@ def build_report(wx: WorkbookXray, assessment=None) -> str:
     A("</div></header>")
 
     for w in wx.warnings:
-        A(f"<div class='warn'>{_esc(w)}</div>")
+        A(f"<div class='warn'>{_esc(safe_scan_message(w, wx.path))}</div>")
     if assessment is not None:
         A(_error_header(assessment.review))
         A(_hidden_header(assessment.review))

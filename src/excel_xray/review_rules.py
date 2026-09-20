@@ -19,6 +19,7 @@ from __future__ import annotations
 import io
 import posixpath
 import re
+import urllib.parse
 import zipfile
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -250,7 +251,7 @@ def build_hidden_summary(wx, tab_index: dict[str, TabFacts], read_by: dict[str, 
 # -------------------------------------------------------------- key inputs
 
 _INPUT_PURPOSE_HINTS = [
-    ("Trial balance", ("trial balance", " tb ", " tb.", "tb_", "gl balance")),
+    ("Trial balance", ("trial balance", "tb", "gl balance", "general ledger")),
     ("Claims data", ("claim",)),
     ("Account mapping", ("mapping", "chart of accounts", "coa")),
     ("Exchange rates", ("exchange", "fx ", "fx_", "fx.", "rate")),
@@ -261,48 +262,127 @@ _INPUT_PURPOSE_HINTS = [
 
 def classify_input_purpose(name: str) -> str:
     low = name.lower()
+    if re.search(r"(?:^|[._\-\s])tb(?:$|[._\-\s])", low):
+        return "Trial balance"
     for label, hints in _INPUT_PURPOSE_HINTS:
-        if any(h in low for h in hints):
+        if any(h != "tb" and h in low for h in hints):
             return label
     return "Unclassified — requires review"
 
 
 def shorten_external(path: str) -> str:
-    """Display filename only; the caller keeps the full path as evidence."""
-    p = str(path).replace("\\", "/")
-    return posixpath.basename(p) or str(path)
+    """Return a normalized workbook name without URL/path details."""
+    raw = urllib.parse.unquote(str(path))
+    parsed = urllib.parse.urlsplit(raw)
+    candidate = parsed.path if parsed.scheme else raw.split("?", 1)[0].split("#", 1)[0]
+    candidate = candidate.replace("\\", "/")
+    return posixpath.basename(candidate.rstrip("/")) or "unresolved external workbook"
 
 
-def group_key_inputs(wx, tab_index: dict[str, TabFacts]) -> dict:
+def _connection_label(connection: dict) -> str:
+    """Return a friendly connection label without server or credential text."""
+    name = str(connection.get("name") or "").strip()
+    if name and not re.search(r"[/\\:@]|password=|server=|uid=|provider=|database=|token=|api[_-]?key=", name, re.I):
+        return name[:80]
+    kind = str(connection.get("type") or "").strip()
+    if kind and not re.search(r"[/\\:@]|password=|server=|uid=|provider=|database=|token=|api[_-]?key=", kind, re.I):
+        return f"{kind} connection"
+    return "Unnamed formal data connection"
+
+
+def group_key_inputs(wx, tab_index: dict[str, TabFacts],
+                     read_by: dict[str, set] | None = None) -> dict:
     """Separate Key Inputs into in-workbook / lookup tables / connections /
     external workbooks (grouped by purpose, filename only) / unresolved."""
-    input_sheets = sorted(n for n, tf in tab_index.items() if "Input" in _roles_of(tf))
     lookup_tables = sorted(n for n, tf in tab_index.items() if "Mapping" in _roles_of(tf))
+    input_sheets = sorted(n for n, tf in tab_index.items()
+                          if "Input" in _roles_of(tf) and n not in lookup_tables)
     data_connections = [
-        {"name": c.get("name") or c.get("type") or "unnamed connection",
+        {"name": _connection_label(c),
          "type": c.get("type")}
         for c in wx.connections
     ]
-    external_consumers = sorted(
-        s.name for s in wx.sheets if s.formula_profile.get("external_count")
-    )
+    source_details = []
+    for name in input_sheets:
+        consumers = sorted((read_by or {}).get(name, set()))
+        reference_count = sum(
+            int(s.formula_profile.get("referenced_sheets", {}).get(name, 0) or 0)
+            for s in wx.sheets
+        )
+        source_details.append({
+            "business_purpose": classify_input_purpose(name),
+            "source_type": "In-workbook input worksheet", "source_name": name,
+            "reference_count": reference_count,
+            "consuming_worksheets": consumers or "No in-workbook consumer detected",
+            "source_status": "Observed worksheet; input role is structurally inferred",
+            "essentiality": "Not established — confirm with process owner",
+        })
+    for name in lookup_tables:
+        consumers = sorted((read_by or {}).get(name, set()))
+        reference_count = sum(
+            int(s.formula_profile.get("referenced_sheets", {}).get(name, 0) or 0)
+            for s in wx.sheets
+        )
+        source_details.append({
+            "business_purpose": classify_input_purpose(name),
+            "source_type": "Lookup or mapping worksheet", "source_name": name,
+            "reference_count": reference_count,
+            "consuming_worksheets": consumers or "No in-workbook consumer detected",
+            "source_status": "Observed worksheet; mapping role is structurally inferred",
+            "essentiality": "Not established — confirm with process owner",
+        })
+    for connection in data_connections:
+        source_details.append({
+            "business_purpose": "Not established — confirm with process owner",
+            "source_type": "Formal data connection", "source_name": connection["name"],
+            "reference_count": 1,
+            "consuming_worksheets": "Not determinable from workbook structure",
+            "source_status": "Connection metadata observed; source contents not verified",
+            "essentiality": "Not established — confirm with process owner",
+        })
     external_groups: dict[str, dict] = {}
+    normalized_links: dict[str, list] = {}
     for link in wx.external_links:
         fname = shorten_external(link)
+        entry = normalized_links.setdefault(fname.casefold(), [fname, 0])
+        entry[1] += 1
+    for fname, reference_count in sorted(normalized_links.values(), key=lambda item: item[0].casefold()):
         purpose = classify_input_purpose(fname)
         g = external_groups.setdefault(purpose, {
-            "purpose": purpose, "files": [], "consuming_worksheets": external_consumers,
-            "essentiality": "requires review — not automatically confirmed",
+            "business_purpose": purpose, "source_type": "External workbook",
+            "files": [],
+            "consuming_worksheets": "Not determinable from workbook structure",
+            "essentiality": "Not established — confirm with the process owner",
         })
-        g["files"].append({"file_name": fname, "full_path_evidence": link})
-    if external_groups:
-        note = ("consuming-worksheet mapping is approximate: OOXML external references "
-                "are not individually attributed to a source link, so every sheet with an "
-                "external reference is listed against every external workbook")
-        for g in external_groups.values():
-            g["evidence_note"] = note
+        existing = next((f for f in g["files"] if f["file_name"] == fname), None)
+        if existing:
+            existing["reference_count"] += reference_count
+        else:
+            g["files"].append({"file_name": fname, "reference_count": reference_count,
+                               "source_status": "Observed reference; availability and contents not verified"})
+        source_details.append({
+            "business_purpose": purpose, "source_type": "External workbook",
+            "source_name": fname, "reference_count": reference_count,
+            "consuming_worksheets": "Not determinable from workbook structure",
+            "source_status": "Observed reference; availability and contents not verified",
+            "essentiality": "Not established — confirm with the process owner",
+        })
 
-    other_unresolved = sorted({p for p in wx.pivot_cache_sources if p and "!" not in p})
+    other_unresolved = sorted({
+        (shorten_external(p) if re.search(r"(?i)\.xls[xmb]?(?:$|[?#])", str(p))
+         else "Unresolved pivot or external data source")
+        for p in wx.pivot_cache_sources if p and "!" not in p
+    })
+    for name in other_unresolved:
+        if name != "none":
+            source_details.append({
+                "business_purpose": "Not established — confirm with process owner",
+                "source_type": "Unresolved pivot or external data source",
+                "source_name": name, "reference_count": 1,
+                "consuming_worksheets": "Not determinable from workbook structure",
+                "source_status": "Source reference observed; source identity not established",
+                "essentiality": "Not established — confirm with process owner",
+            })
 
     return {
         "in_workbook_sheets": input_sheets or ["none identified as a dedicated input tab"],
@@ -310,6 +390,7 @@ def group_key_inputs(wx, tab_index: dict[str, TabFacts]) -> dict:
         "data_connections": data_connections or ["none"],
         "external_workbooks": list(external_groups.values()) or ["none"],
         "other_unresolved_sources": other_unresolved or ["none"],
+        "source_details": source_details,
     }
 
 
@@ -359,15 +440,15 @@ def business_calculation_description(s, tf: TabFacts | None) -> str | None:
     elif "Mapping" in roles or lookup >= total * 0.3:
         verb = "Maps codes or values through a lookup/reference table"
     elif "Control Check" in roles or "Validation" in roles:
-        verb = "Matches records between sources and reports exceptions"
+        verb = "Supports a control or validation check; confirm the matching rule and exception handling"
     elif "Output" in roles:
-        verb = "Produces a reporting or management-information schedule"
+        verb = "Supports a reporting-oriented worksheet; confirm the final business deliverable"
     elif agg >= total * 0.3:
         verb = "Aggregates detailed data into summary totals"
     else:
         return None
 
-    output = "this tab is itself the deliverable" if "Output" in roles else \
+    output = "tab has a structurally inferred output role" if "Output" in roles else \
         "feeds a downstream calculation or output tab"
     return f"{verb} (tab: {s.name}; {output})."
 
@@ -380,32 +461,39 @@ _RECON_KEY_HINTS = ("id", "code", "ref", "key", "account", "policy")
 
 
 def reconciliation_detail(s) -> dict:
-    """Source / target / key / tolerance / exception / output when it can be
-    read off headers and formula shapes — otherwise a targeted question. A
-    count of VLOOKUP/MATCH/INDEX alone is never treated as sufficient."""
-    fns = dict(s.formula_profile.get("top_functions", []))
-    has_lookup = any(fns.get(f) for f in _MAPPING_FNS)
-    has_abs = bool(fns.get("ABS"))
-    if not (has_lookup or has_abs):
-        return {"status": "not_detected"}
+    """Return a review candidate, never a confirmed tie-out from headers alone.
 
+    The structural scan does not inspect calculated values or prove that two
+    sources agree, so confirmation always remains with the process owner.
+    """
+    fns = dict(s.formula_profile.get("top_functions", []))
+    has_abs = bool(fns.get("ABS"))
     headers = [h for r in s.regions for h in r.headers if h]
+    header_text = " ".join(headers).lower()
+    labeled_recon = any(word in header_text or word in s.name.lower()
+                        for word in ("recon", "variance", "difference", "tie out", "tie-out", "matched"))
     source = next((h for h in headers if any(k in h.lower() for k in _RECON_SRC_HINTS)), None)
     target = next((h for h in headers if any(k in h.lower() for k in _RECON_TGT_HINTS)), None)
     key = next((h for h in headers if any(k in h.lower() for k in _RECON_KEY_HINTS)), None)
-    if source and target and key:
-        return {
-            "source": source, "comparison_target": target, "matching_key": key,
-            "tolerance": "ABS()/threshold comparison present" if has_abs else "not evidenced",
-            "exception_rule": "not evidenced from headers — confirm with preparer",
-            "result_output": s.name,
-        }
-    return {"question": (
-        f"What source is being reconciled, what is the comparison target, and where "
-        f"are exceptions reviewed on tab '{s.name}'? (lookup/variance formulas were "
-        f"detected, but the source, target and matching key could not be resolved "
-        f"from headers alone.)"
-    )}
+    if not (labeled_recon or (has_abs and source and target)):
+        return {"status": "not_detected"}
+    evidence = []
+    if has_abs:
+        evidence.append("absolute-difference formula observed")
+    if labeled_recon:
+        evidence.append("reconciliation/variance label observed")
+    return {
+        "status": "candidate — owner confirmation required",
+        "source": source or "not established",
+        "comparison_target": target or "not established",
+        "matching_key": key or "not established",
+        "agreement_evidence": "not established from workbook structure",
+        "variance_rule": "not established from workbook structure",
+        "exception_output": "not established from workbook structure",
+        "observed_evidence": evidence,
+        "reviewer_question": (f"Confirm the two sources, matching key, agreement or tolerance rule, "
+                              f"and where exceptions are reviewed for '{s.name}'."),
+    }
 
 
 # ------------------------------------------------------------ manual entry
@@ -419,76 +507,53 @@ def manual_intervention_tab(s) -> dict:
     name = s.name.lower()
     headers = [h.lower() for r in s.regions for h in r.headers if h]
     hits = [h for h in [name] + headers if any(k in h for k in _MANUAL_HINTS)]
-    fp = s.formula_profile
-    if hits:
-        return {"basis": "derived",
-                "value": f"Explicit manual-entry/override area evidenced on '{s.name}'",
-                "evidence": sorted(set(hits))[:5]}
-    if fp.get("hardcoded_literal_count"):
-        return {"basis": "derived",
-                "value": (f"{fp['hardcoded_literal_count']} formula(s) on '{s.name}' "
-                          f"contain a hardcoded value — a possible manual override "
-                          f"buried in a formula"),
-                "evidence": [f"{fp['hardcoded_literal_count']} hardcoded literal(s) in formulas"]}
-    return {"basis": "needs_human", "value": None, "evidence": [],
-            "question": f"What do users enter, paste, adjust or override on '{s.name}'?"}
+    return {"basis": "needs_human",
+            "value": ("Not established — confirm which inputs are keyed, pasted, "
+                      "adjusted or overridden, by whom and how often."),
+            "evidence": sorted(set(hits))[:5],
+            "question": f"What do users enter, paste, adjust or override on '{s.name}', and how often?"}
 
 
 def manual_intervention_file(wx) -> dict:
-    per_tab = {s.name: manual_intervention_tab(s) for s in wx.sheets}
-    concrete = {n: v["value"] for n, v in per_tab.items() if v["basis"] == "derived"}
-    if concrete:
-        return {"basis": "derived", "value": concrete,
-                "evidence": [f"{len(concrete)}/{len(wx.sheets)} tab(s) show explicit "
-                            f"manual-entry/override evidence"]}
-    return {"basis": "needs_human", "value": None,
-            "evidence": ["no explicit manual-entry/override area evidenced structurally "
-                        "on any tab"],
-            "question": "What do users enter, paste, adjust or override in this "
-                        "workbook, and on which tabs?"}
+    return {"basis": "needs_human",
+            "value": ("Not established — confirm which inputs are keyed, pasted, "
+                      "adjusted or overridden, by whom and how often."),
+            "evidence": ["manual actions and ownership are not established by workbook structure"],
+            "question": "Which inputs are keyed, pasted, adjusted or overridden, by whom and how often?"}
 
 
 # -------------------------------------------------------------- automation
 
 def automation_candidates(wx, tab_index: dict[str, TabFacts]) -> list[dict]:
-    """Per-tab automation candidates. Formula reuse/lookups/connections are
-    supporting signals only — never the sole basis for a verdict."""
+    """Show only evidence-backed workflow leads that need owner validation."""
     out = []
     for s in wx.sheets:
         tf = tab_index.get(s.name)
         if tf is None:
             continue
-        roles = _roles_of(tf)
         fp = s.formula_profile
         distinct = fp.get("distinct_skeletons", 0)
         comp = fp.get("total", 0) / distinct if distinct else 0
-        signals = []
-        if comp >= 5:
-            signals.append(f"formula reuse {comp:.0f}x — a regular, codifiable rule")
-        if wx.connections or wx.external_links:
-            signals.append("existing data connection/link — source is already systemised")
-        if "Control Check" in roles or "Validation" in roles:
-            signals.append("reconciliation/matching pattern — a classic automation target")
-        manual = manual_intervention_tab(s)
-        if not signals:
-            out.append({
-                "worksheet": s.name, "verdict": "Candidate — workflow confirmation required",
-                "suspected_manual_step": manual.get("value") or "not established",
-                "required_inputs": "not established", "repeated_business_rule": "not established",
-                "frequency": "unknown", "exceptions": "unknown",
-                "review_or_approval_controls": "unknown",
-                "output_produced": tf.information, "evidence": [],
-            })
+        label_text = " ".join([s.name] + [h for r in s.regions for h in r.headers if h]).lower()
+        manual_terms = ("manual", "paste", "override", "adjustment", "input", "keyed")
+        if not any(term in label_text for term in manual_terms):
             continue
+        signals = ["worksheet labels suggest a manual input or adjustment step"]
+        if comp >= 5:
+            signals.append(f"repeated formula pattern observed ({comp:.0f} uses per shape)")
         out.append({
-            "worksheet": s.name, "verdict": "Candidate",
-            "suspected_manual_step": manual.get("value") or "not evidenced structurally",
-            "required_inputs": "needs_human",
-            "repeated_business_rule": (f"{distinct} distinct formula shape(s)"
-                                       if fp.get("total") else "n/a"),
-            "frequency": "unknown — needs_human", "exceptions": "unknown — needs_human",
-            "review_or_approval_controls": "unknown — needs_human",
-            "output_produced": tf.information, "evidence": signals,
+            "process": "Not established — confirm with process owner",
+            "sub_process": "Not established — confirm with process owner",
+            "worksheet": s.name,
+            "verdict": "Potential workflow lead — owner confirmation required",
+            "observed_manual_step": "Not established — confirm with process owner",
+            "required_inputs": "Confirm with process owner",
+            "repeated_business_rule": f"{distinct} distinct formula shape(s)" if fp.get("total") else "not observed",
+            "frequency": "Confirm with process owner",
+            "exceptions_and_controls": "Confirm with process owner",
+            "candidate_action": "Map the manual steps, inputs, approval controls and exceptions before assessing automation.",
+            "evidence": signals,
+            "requires_human_confirmation": True,
         })
     return out
 
@@ -526,6 +591,8 @@ def simplification_candidates(wx, tab_index: dict[str, TabFacts]) -> list[dict]:
             ))
         for current, change, benefit in issues:
             out.append({
+                "process": "Not established — confirm with process owner",
+                "sub_process": activity if activity != "unknown" else "Not established — confirm with process owner",
                 "worksheet": s.name, "business_activity": activity,
                 "current_complexity": current, "proposed_change": change,
                 "expected_benefit": benefit, "evidence": [current],
@@ -540,7 +607,7 @@ def retirement_assessment() -> dict:
     """Retirement is never inferred from hidden sheets, cached errors, file
     age or a suggestive filename — those are not evidence of disuse."""
     return {
-        "verdict": "Not established — owner decision required.",
+        "verdict": "Not established — confirm with the process owner.",
         "confirmation_needed": ["active usage", "owner", "recipients",
                                 "replacement coverage",
                                 "regulatory or retention requirements"],
@@ -601,7 +668,10 @@ def macro_details(wx) -> dict:
             ),
         },
         "power_query": wx.has_power_query,
-        "data_connections": [c.get("name") or c.get("type") or "unnamed"
-                             for c in wx.connections] or ["none"],
+        "formal_data_connections": {
+            "count": len(wx.connections),
+            "summary": (f"{len(wx.connections)} formal data connection(s) detected"
+                        if wx.connections else "No formal data connections detected"),
+        },
         "external_workbook_links": len(wx.external_links),
     }

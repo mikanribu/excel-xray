@@ -33,6 +33,10 @@ class Narrative:
     purpose_of_file: str | None = None
     key_output_outcome: str | None = None
     key_outputs: list | None = None
+    process: str | None = None
+    sub_process: str | None = None
+    process_evidence: list[str] = field(default_factory=list)
+    sub_process_evidence: list[str] = field(default_factory=list)
     tabs: dict[str, str] = field(default_factory=dict)  # tab name -> purpose
 
 
@@ -61,6 +65,7 @@ def build_bundle(assessment, wx) -> dict:
 
     tabs = []
     sheet_by_name = {s.name: s for s in wx.sheets}
+    business_evidence = [wx.filename]
     for ta in assessment.tabs:
         name = ta.tab_name.value
         s = sheet_by_name.get(name)
@@ -68,6 +73,7 @@ def build_bundle(assessment, wx) -> dict:
         if s:
             for r in s.regions:
                 headers += [h for h in r.headers if h]
+        business_evidence.extend([name] + headers)
         kc = ta.key_calculation_transformation_logic.value
         tabs.append({
             "name": name,
@@ -76,7 +82,6 @@ def build_bundle(assessment, wx) -> dict:
             "roles": ta.tab_roles.value,
             "information": ta.tab_information_analysis.value,
             "headers": headers[:20],
-            "top_functions": (kc or {}).get("top_functions", []) if isinstance(kc, dict) else [],
             "business_description": (kc or {}).get("business_description") if isinstance(kc, dict) else None,
             "upstream": ta.upstream_dependencies.value,
             "downstream": ta.downstream_dependencies.value.get("in_workbook")
@@ -87,31 +92,20 @@ def build_bundle(assessment, wx) -> dict:
     return {
         "file_name": val(fa.file_name),
         "business_area_process": val(fa.business_area_process),
+        "process": val(fa.process),
+        "sub_process": val(fa.sub_process),
         "complexity": val(fa.complexity),
         "logic_type": val(fa.logic_type),
         "logic_types": val(fa.logic_types),
         "key_calculations": val(fa.key_calculations_logic),
         "key_inputs": val(fa.key_inputs),
         "sheet_count": len(wx.sheets),
+        "business_evidence": list(dict.fromkeys(x for x in business_evidence if x)),
         "tabs": tabs,
     }
 
 
 # ------------------------------------------------------------- offline assessor
-
-
-def _stem(name: str) -> str:
-    return name.rsplit(".", 1)[0] if "." in name else name
-
-
-_PURPOSE_VERB = {
-    "Calculation": "perform calculations / modelling",
-    "Reconciliation": "reconcile or match figures across sources",
-    "Data Transformation": "transform and reshape source data",
-    "Reporting": "assemble reporting / MI output",
-    "Manual Input": "capture data entered by hand",
-    "Other": "support a business process",
-}
 
 
 class OfflineAssessor:
@@ -124,65 +118,23 @@ class OfflineAssessor:
         logic = bundle.get("logic_type") or "Other"
         cats = [t["category"] for t in bundle["tabs"]]
         cat_counts = ", ".join(sorted({c for c in cats})) or "no classified tabs"
-        outputs = [t["name"] for t in bundle["tabs"]
-                  if t["category"] == "Output" or "Output" in (t.get("roles") or [])]
-        top_fns = (bundle.get("key_calculations") or {}).get("top_functions", []) \
-            if isinstance(bundle.get("key_calculations"), dict) else []
-
-        purpose = (
-            f"'{_stem(bundle['file_name'])}' is a {bundle.get('complexity','').lower()}"
-            f"-complexity {logic.lower()} workbook across {bundle['sheet_count']} tab(s) "
-            f"({cat_counts}). It appears to {_PURPOSE_VERB.get(logic, _PURPOSE_VERB['Other'])}"
-            + (f", using {', '.join(top_fns[:4])}" if top_fns else "")
-            + "."
-        )
-        inputs = bundle.get("key_inputs")
-        input_labels: list[str] = []
-        if isinstance(inputs, dict):
-            for key in ("in_workbook_sheets", "lookup_mapping_tables", "data_connections"):
-                for v in inputs.get(key) or []:
-                    if isinstance(v, str) and v not in ("none", "none identified",
-                                                        "none identified as a dedicated input tab"):
-                        input_labels.append(v)
-                    elif isinstance(v, dict):
-                        input_labels.append(str(v.get("name") or v.get("file_name") or v))
-            for ext in inputs.get("external_workbooks") or []:
-                if isinstance(ext, dict):
-                    input_labels += [f["file_name"] for f in ext.get("files", [])]
-        elif isinstance(inputs, list):
-            input_labels = [str(x) for x in inputs]
-        if input_labels:
-            purpose += f" Inputs: {', '.join(input_labels[:3])}."
-
-        outcome = (
-            f"Supports {(bundle.get('business_area_process') or logic).lower()}; "
-            + (f"headline output on tab(s) {', '.join(outputs)}."
-               if outputs else "outputs are produced within the calculation tabs.")
-        )
-
-        key_outputs = []
-        for t in bundle["tabs"]:
-            if t["category"] == "Output" or (not outputs and t["information"] == "output"):
-                label = t["name"]
-                if t["headers"]:
-                    label += f" ({', '.join(t['headers'][:5])})"
-                key_outputs.append(label)
-
+        purpose = "Not established — confirm the workbook's business purpose with the process owner."
+        outcome = "Not established — confirm the final business outcome and recipient with the process owner."
         tab_purposes = {}
         for t in bundle["tabs"]:
-            fns = ", ".join(t["top_functions"][:3])
             hdr = ", ".join(t["headers"][:4])
             tab_purposes[t["name"]] = (
                 f"{t['category']} tab ({t['information']})."
                 + (f" Columns: {hdr}." if hdr else "")
-                + (f" Key logic: {fns}." if fns else "")
                 + (" Hidden sheet." if t["hidden"] else "")
             )
 
         return Narrative(
             purpose_of_file=purpose,
             key_output_outcome=outcome,
-            key_outputs=key_outputs or ["no distinct output tab identified"],
+            key_outputs=[],
+            process="Not established — confirm with the process owner",
+            sub_process="Not established — confirm with the process owner",
             tabs=tab_purposes,
         )
 
@@ -203,8 +155,18 @@ _INSTRUCTION = (
     "Return JSON with exactly these keys:\n"
     '  "purpose_of_file": string — 1-2 sentences on what the workbook is for.\n'
     '  "key_output_outcome": string — the business outcome it supports.\n'
-    '  "key_outputs": array of strings — the main outputs produced.\n'
+    '  "key_outputs": array of strings — final business deliverables only; exclude intermediate workings.\n'
+    '  "process": string — business process, or "Not established — confirm with the process owner".\n'
+    '  "sub_process": string — narrower activity, or the same not-established value.\n'
+    '  "process_evidence": array of exact text snippets copied from the evidence below.\n'
+    '  "sub_process_evidence": array of exact text snippets copied from the evidence below.\n'
     '  "tabs": object mapping each tab name to a one-sentence purpose.\n'
+    "Only classify process/sub-process when specific business terms in the workbook name, "
+    "worksheet names, or headers support it; generic terms such as Input, Output, Calculation, "
+    "Model, Data, and Summary are not sufficient. "
+    "Return exact source snippets in process_evidence and sub_process_evidence. "
+    "Use no formula counts, function names, or formula skeletons as business conclusions. "
+    "List Key Outputs only when a final business deliverable is evidenced; otherwise return [].\n"
     "Evidence:\n"
 )
 
@@ -243,6 +205,10 @@ class ClaudeAssessor:
             purpose_of_file=data.get("purpose_of_file"),
             key_output_outcome=data.get("key_output_outcome"),
             key_outputs=data.get("key_outputs"),
+            process=data.get("process"),
+            sub_process=data.get("sub_process"),
+            process_evidence=data.get("process_evidence") or [],
+            sub_process_evidence=data.get("sub_process_evidence") or [],
             tabs=data.get("tabs") or {},
         )
 
@@ -314,6 +280,10 @@ class OpenAIAssessor:
             purpose_of_file=data.get("purpose_of_file"),
             key_output_outcome=data.get("key_output_outcome"),
             key_outputs=data.get("key_outputs"),
+            process=data.get("process"),
+            sub_process=data.get("sub_process"),
+            process_evidence=data.get("process_evidence") or [],
+            sub_process_evidence=data.get("sub_process_evidence") or [],
             tabs=data.get("tabs") or {},
         )
 

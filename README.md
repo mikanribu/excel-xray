@@ -81,6 +81,20 @@ No API key or model service is needed for the default offline assessment.
 | `portfolio_findings.csv` | Findings consolidated across the EUCs in the run |
 | `portfolio.sqlite` | Indexed dashboard data; keep this file and the source workbooks available to use the dashboard later |
 
+The consolidated file summary includes scan status, concise scan errors,
+total/hidden worksheet counts, Business Area / Process, Process and
+Sub-Process, plus the file-level review fields. A process label is left as
+“Not established” when the workbook does not contain direct supporting
+evidence. Input sources are grouped by purpose and type, with workbook names,
+reference counts, known worksheet consumers and an explicit owner check for
+source essentiality.
+
+Reviewer-facing CSV and Excel exports do not include local source paths, file
+sizes or raw SHA-256 values. Technical formula patterns remain in the
+individual report's formula appendix; the Key calculations field contains
+plain-language descriptions. Original workbooks can still be downloaded
+individually or included in the selected-files ZIP.
+
 The default folder run creates no per-file JSON or HTML reports. Individual
 HTML/Excel reports are generated on demand in the dashboard. To scan one
 workbook directly, use `uv run excel-xray file.xlsx -o out/`; it writes the
@@ -182,7 +196,7 @@ Layers, deliberately separated.
 | [regions.py](src/excel_xray/regions.py) | Occupancy runs → connected components → header inference → classification. Detects hand-built table regions nothing off-the-shelf finds |
 | [formulas.py](src/excel_xray/formulas.py) | A1 → R1C1 → literal abstraction. Collapses a filled-down column to one skeleton |
 | [scan.py](src/excel_xray/scan.py) | Triage, orchestration, occupancy plate |
-| [assessment.py](src/excel_xray/assessment.py) | Evidence → EUC schema: complexity, logic type, tab categories, dependencies, human-validation, heuristic findings |
+| [assessment.py](src/excel_xray/assessment.py) | Evidence → EUC schema: complexity, controlled logic types, tab categories, dependencies, human-validation, heuristic findings |
 | [narrative.py](src/excel_xray/narrative.py) | Narrative fields behind an `Assessor` interface: offline template (default) or Claude (`--llm`) |
 | [corpus.py](src/excel_xray/corpus.py) | Per-file duplication/consolidation fields (formula shapes + headers) |
 | [portfolio.py](src/excel_xray/portfolio.py) | One-at-a-time folder scan, SQLite store, cross-EUC findings, consolidated CSV/Excel and selected bundles |
@@ -212,11 +226,11 @@ most consequential constant in the detector.
 
 Produced at two levels, matching the review template:
 
-**File level summary** — File ID/Name, Business Area, Purpose, Key Output /
-Outcome, Complexity, Key Inputs, Source System, Key Outputs, Usage Frequency,
+**File level summary** — File ID/Name, Business Area / Process, Process,
+Sub-Process, Purpose, Key Output / Outcome, Complexity, Key Inputs, Source System, Key Outputs, Usage Frequency,
 Completion Timeline, EUC Preparer, Output Recipient; the AI findings (Potential
 Duplication, Similar/Duplicate Files, Simplification, Consolidation, Automation,
-Retirement); and workbook logic (Logic Type, Key calculations, Reconciliation
+Retirement); and workbook logic (Logic Types, Key calculations, Reconciliation
 logic, Manual intervention, Macros/VBA/links).
 
 **Tab level details** — per sheet: Tab Name, Category (Input / Calculation /
@@ -234,9 +248,11 @@ for t in a.tabs:
 
 ### Narrative fields and the LLM
 
-Purpose, Key Output/Outcome, Key Outputs and each tab's Purpose are written by an
-`Assessor`. The default is offline (network-free, `drafted`). Pass `--llm` to use
-a model instead (`inferred`); this needs the optional `anthropic` and/or `openai`
+Purpose, Key Output/Outcome, Process, Sub-Process and each tab's Purpose are written by an
+`Assessor`. The default is offline (network-free, `drafted`); unknown business
+labels stay “Not established” for owner confirmation. Pass `--llm` to use a
+model instead (`inferred`); process labels must be supported by exact workbook
+text. This needs the optional `anthropic` and/or `openai`
 package and a credential:
 
 ```bash

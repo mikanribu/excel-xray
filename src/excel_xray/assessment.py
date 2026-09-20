@@ -23,12 +23,14 @@ automation/simplification/retirement/reconciliation — live in
 from __future__ import annotations
 
 import datetime as _dt
-from dataclasses import asdict, dataclass, field
+import re
 from collections import Counter
+from dataclasses import asdict, dataclass, field
 
 from . import review_rules as rr
 from .review_rules import TabFacts, visibility_of
 from .scan import WorkbookXray
+from .util import safe_scan_message
 
 # --------------------------------------------------------------------- Field
 
@@ -76,6 +78,8 @@ class FileAssessment:
     file_id: Field = field(default_factory=Field)
     file_name: Field = field(default_factory=Field)
     business_area_process: Field = field(default_factory=Field)
+    process: Field = field(default_factory=Field)
+    sub_process: Field = field(default_factory=Field)
     purpose_of_file: Field = field(default_factory=Field)
     key_output_outcome: Field = field(default_factory=Field)
     complexity: Field = field(default_factory=Field)
@@ -139,6 +143,7 @@ class Assessment:
     file: FileAssessment
     tabs: list[TabAssessment] = field(default_factory=list)
     review: ReviewFindings = field(default_factory=ReviewFindings)
+    scan: dict = field(default_factory=dict)
 
 
 # ---------------------------------------------------------- workbook metrics
@@ -212,7 +217,7 @@ def _complexity(wx: WorkbookXray, t: dict) -> Field:
 
 
 def _logic_type(wx: WorkbookXray, t: dict) -> tuple[Field, Counter]:
-    """Reconciliation / Calculation / Data Transformation / Manual Input / Reporting.
+    """Score the controlled workbook activity taxonomy from structural evidence.
 
     Returns the primary logic-type Field plus the raw score Counter, so
     :func:`_logic_types` can list every material activity without recomputing.
@@ -224,11 +229,10 @@ def _logic_type(wx: WorkbookXray, t: dict) -> tuple[Field, Counter]:
     lookup = sum(fns[f] for f in ("VLOOKUP", "HLOOKUP", "XLOOKUP", "MATCH", "INDEX"))
     agg = sum(fns[f] for f in ("SUM", "SUMIF", "SUMIFS", "AVERAGE", "COUNT", "COUNTIF", "SUBTOTAL"))
     textfn = sum(fns[f] for f in ("TEXT", "CONCATENATE", "CONCAT", "LEFT", "RIGHT", "MID", "TRIM", "SUBSTITUTE"))
-    cond = sum(fns[f] for f in ("IF", "IFS", "IFERROR"))
 
     if lookup:
-        scores["Reconciliation"] += lookup + cond * 0.5
-        ev.append(f"{lookup} lookup/match call(s) — matching across sources")
+        scores["Data Transformation"] += lookup
+        ev.append(f"{lookup} lookup/match call(s) — mapping or data preparation")
     if agg:
         scores["Calculation"] += agg
         ev.append(f"{agg} aggregation call(s)")
@@ -239,13 +243,12 @@ def _logic_type(wx: WorkbookXray, t: dict) -> tuple[Field, Counter]:
         scores["Data Transformation"] += 5
         ev.append("Power Query present")
     if wx.pivot_cache_sources:
-        scores["Reporting/MI"] += 3
+        scores["Reporting"] += 3
         ev.append(f"{len(wx.pivot_cache_sources)} pivot source(s) — reporting")
 
-    formula_ratio = t["formulas"] / max(1, t["cells"])
-    if formula_ratio < 0.05:
-        scores["Manual Input"] += 4
-        ev.append(f"only {formula_ratio:.0%} of cells are formulas — largely manual")
+    if t["formulas"] and not scores:
+        scores["Calculation"] += 1
+        ev.append("formula calculations detected")
 
     if not scores:
         return Field.derived("Other", 0.4, ev or ["no dominant logic signal"]), scores
@@ -266,13 +269,23 @@ def _logic_types(scores: Counter, wx: WorkbookXray, tab_index: dict[str, TabFact
         types = [k for k, v in scores.most_common() if v >= 0.25 * top]
         ev.append("scored from function mix: " + ", ".join(f"{k}={v:.1f}" for k, v in scores.most_common()))
     if any("Mapping" in (tf.roles or []) or tf.category == "Mapping" for tf in tab_index.values()):
-        if "Mapping" not in types:
-            types.append("Mapping")
+        if "Data Transformation" not in types:
+            types.append("Data Transformation")
         ev.append("one or more tabs carry the Mapping role")
     if any("Output" in (tf.roles or []) or tf.category == "Output" for tf in tab_index.values()):
-        if "Reporting/MI" not in types:
-            types.append("Reporting/MI")
+        if "Reporting" not in types:
+            types.append("Reporting")
         ev.append("one or more tabs carry the Output role")
+    if any("Control Check" in tf.roles or "Validation" in tf.roles
+           or tf.category in {"Control Check", "Validation"} for tf in tab_index.values()):
+        types.append("Reconciliation / Control")
+        ev.append("one or more tabs carry a Control Check or Validation role")
+    if any("Input" in tf.roles or tf.category == "Input" for tf in tab_index.values()):
+        types.append("Manual Input")
+        ev.append("one or more tabs carry an Input role")
+    allowed = {"Calculation", "Reporting", "Data Transformation",
+               "Reconciliation / Control", "Manual Input", "Other"}
+    types = list(dict.fromkeys(t for t in types if t in allowed))
     if not types:
         types = ["Other"]
     return Field.derived(types, 0.6, ev or ["no dominant activity signal"])
@@ -280,11 +293,10 @@ def _logic_types(scores: Counter, wx: WorkbookXray, tab_index: dict[str, TabFact
 
 _BUSINESS_AREA = {
     "Calculation": "Calculation / modelling",
-    "Reconciliation": "Reconciliation / control",
+    "Reconciliation / Control": "Reconciliation / control",
     "Data Transformation": "Data preparation / transformation",
-    "Reporting/MI": "Reporting / MI",
+    "Reporting": "Reporting / MI",
     "Manual Input": "Manual data capture",
-    "Mapping": "Reference data / mapping maintenance",
     "Other": "General-purpose / other",
 }
 
@@ -298,8 +310,9 @@ def _business_area(logic_types: Field) -> Field:
                          [f"mapped from logic types: {', '.join(types)}"])
 
 
-def _key_inputs(wx: WorkbookXray, tab_index: dict[str, TabFacts]) -> Field:
-    grouped = rr.group_key_inputs(wx, tab_index)
+def _key_inputs(wx: WorkbookXray, tab_index: dict[str, TabFacts],
+                read_by: dict[str, set]) -> Field:
+    grouped = rr.group_key_inputs(wx, tab_index, read_by)
     return Field.extracted(
         grouped,
         ["grouped by in-workbook sheets / lookup-mapping tables / data connections / "
@@ -308,16 +321,15 @@ def _key_inputs(wx: WorkbookXray, tab_index: dict[str, TabFacts]) -> Field:
 
 
 def _source_system(wx: WorkbookXray) -> Field:
-    systems: list[str] = []
-    for c in wx.connections:
-        s = c.get("connection_string") or c.get("command") or c.get("description")
-        if s:
-            systems.append(str(s))
-    systems += [p for p in wx.pivot_cache_sources if ("!" not in p and p)]
+    systems = sorted({str(c.get("name")).strip() for c in wx.connections
+                      if c.get("name") and not re.search(
+                          r"[/\\:@]|password=|server=|uid=|provider=|database=|token=", str(c.get("name")), re.I)})
     if systems:
-        return Field.extracted(sorted(set(systems)))
-    return Field.pending("needs_human",
-                         "no data connections declare a source system")
+        return Field.extracted(systems, ["connection display names only; connection strings are excluded"])
+    return Field(value="Not established — confirm the source system with the process owner",
+                 basis="needs_human",
+                 evidence=["No safe source-system name was identified from formal connection metadata",
+                           "reviewer question: Which system provides the source data?"])
 
 
 def _euc_preparer(wx: WorkbookXray) -> Field:
@@ -334,30 +346,21 @@ def _euc_preparer(wx: WorkbookXray) -> Field:
 def _key_calculations(wx: WorkbookXray, t: dict, tab_index: dict[str, TabFacts]) -> Field:
     if not t["formulas"]:
         return Field.extracted([], ["workbook has no formulas"])
-    skeletons: Counter = Counter()
-    for s in wx.sheets:
-        for sk, n in s.formula_profile.get("top_skeletons", []):
-            skeletons[sk] += n
-    top = [f"{sk}  (×{n})" for sk, n in skeletons.most_common(8)]
-    top_fns = [f"{fn}×{n}" for fn, n in t["functions"].most_common(8)]
     descriptions = []
     for s in wx.sheets:
         d = rr.business_calculation_description(s, tab_index.get(s.name))
         if d:
             descriptions.append(d)
     return Field.extracted(
-        {"top_functions": top_fns, "top_formula_shapes": top,
-         "business_descriptions": descriptions},
-        [f"{t['formulas']:,} formulas reduce to {t['distinct']} distinct shapes",
-         "business descriptions are plain-language, tied to a named tab; "
-         "technical shapes/functions remain the underlying evidence"],
+        {"business_descriptions": descriptions or [
+            "Formula calculations are present; the business calculation purpose is not established from structure."
+        ]},
+        ["plain-language business descriptions only; technical formula patterns are in the technical appendix"],
     )
 
 
 def _manual_intervention(wx: WorkbookXray) -> Field:
     d = rr.manual_intervention_file(wx)
-    if d["basis"] == "derived":
-        return Field.derived(d["value"], 0.65, d["evidence"])
     return Field(value=d["value"], basis="needs_human",
                  evidence=d["evidence"] + [f"reviewer question: {d['question']}"])
 
@@ -391,8 +394,9 @@ def _months_since(iso: str | None) -> int | None:
 
 def _simplification(wx: WorkbookXray, tab_index: dict[str, TabFacts]) -> Field:
     candidates = rr.simplification_candidates(wx, tab_index)
-    verdict = "Yes" if len(candidates) >= 2 else "Possibly" if candidates else "No"
-    conf = 0.55 + 0.1 * min(3, len(candidates))
+    verdict = ("Potential simplification lead — confirm with process owner"
+               if candidates else "No structural simplification lead detected")
+    conf = 0.6
     return Field.derived(
         {"verdict": verdict, "candidates": candidates},
         min(conf, 0.85),
@@ -404,17 +408,13 @@ def _simplification(wx: WorkbookXray, tab_index: dict[str, TabFacts]) -> Field:
 
 def _automation(wx: WorkbookXray, tab_index: dict[str, TabFacts]) -> Field:
     candidates = rr.automation_candidates(wx, tab_index)
-    concrete = [c for c in candidates if c["verdict"] == "Candidate"]
-    if concrete:
-        verdict = "Yes" if len(concrete) >= 2 else "Possibly"
-    else:
-        verdict = "Unlikely" if not candidates else "Possibly"
-    conf = 0.55 + 0.1 * min(3, len(concrete))
+    verdict = ("Potential workflow lead — confirm manual steps with process owner"
+               if candidates else
+               "Not established — confirm the observed manual process with its owner")
     return Field.derived(
         {"verdict": verdict, "candidates": candidates},
-        min(conf, 0.85),
-        [f"{len(concrete)} concrete candidate(s), "
-         f"{len(candidates) - len(concrete)} needing workflow confirmation"],
+        0.6,
+        [f"{len(candidates)} explicitly labelled input/adjustment workflow lead(s); owner confirmation required"],
     )
 
 
@@ -424,60 +424,54 @@ def _retirement() -> Field:
 
 
 def _reconciliation_logic(wx: WorkbookXray) -> Field:
-    details = []
+    candidates = []
     questions = []
     for s in wx.sheets:
         d = rr.reconciliation_detail(s)
         if d.get("status") == "not_detected":
             continue
-        if "question" in d:
-            questions.append(d["question"])
-        else:
-            details.append({"tab": s.name, **d})
-    if not details and not questions:
+        if "reviewer_question" in d:
+            questions.append(d["reviewer_question"])
+            candidates.append({"tab": s.name, **d})
+    if not candidates:
         return Field.derived(
             "No reconciliation pattern detected", 0.6,
             ["no lookup/variance logic or reconciliation-labelled headers on any tab"],
         )
     return Field.derived(
-        {"resolved": details, "reviewer_questions": questions}, 0.6,
-        ["heuristic from functions, formula shapes and headers per tab; a count of "
-         "VLOOKUP/MATCH/INDEX alone is not treated as sufficient evidence"],
+        {"candidates": candidates, "reviewer_questions": questions}, 0.6,
+        ["structural candidates only; agreement, tolerance and exception handling require owner confirmation"],
     )
 
 
 def _key_outputs(tabs: list["TabAssessment"]) -> Field:
-    """Distinguish final deliverables from supporting/intermediate/input/mapping
-    tabs, rather than treating every calculation or note tab as an output."""
-    buckets: dict[str, list[str]] = {
-        "final_business_deliverables": [], "supporting_schedules": [],
-        "intermediate_workings": [], "input_worksheets": [], "mapping_tables": [],
-    }
+    """List final business deliverables only when report-like evidence exists."""
+    deliverables: list[str] = []
+    output_terms = ("report", "summary", "dashboard", "statement", "pack", "submission",
+                    "result", "claims paid", "claim performance", "reserve movement",
+                    "management account", "p&l", "profit and loss", "balance sheet",
+                    "income statement", "cash flow")
     for ta in tabs:
         roles = set(ta.tab_roles.value or []) | {ta.tab_category.value}
-        info = ta.tab_information_analysis.value
         name = ta.tab_name.value
-        if "Output" in roles or info == "final output":
-            buckets["final_business_deliverables"].append(name)
-        elif info == "supporting schedule":
-            buckets["supporting_schedules"].append(name)
-        elif info == "intermediate working":
-            buckets["intermediate_workings"].append(name)
-        elif "Input" in roles or info == "data input":
-            buckets["input_worksheets"].append(name)
-        elif "Mapping" in roles or info == "mapping":
-            buckets["mapping_tables"].append(name)
-    ev = [f"{k}: {len(v)} tab(s)" for k, v in buckets.items() if v]
-    ev.append("a final output requires the Output role (terminal/named/reporting "
-              "evidence) — see each tab's Tab Information Analysis evidence")
-    return Field.derived(buckets, 0.6, ev)
+        name_is_report = any(term in name.lower() for term in output_terms)
+        if "Output" in roles and name_is_report:
+            deliverables.append(name)
+    ev = [f"{len(deliverables)} report-like final business deliverable(s) identified by worksheet name"]
+    if not deliverables:
+        ev.append("confirm final business deliverables with the process owner")
+    value = {"final_business_deliverables": deliverables}
+    if not deliverables:
+        value["status"] = "Not established — confirm the final business deliverable with the process owner"
+    return Field.derived(value, 0.6, ev)
 
 
 # ------------------------------------------------------------------- entry
 
 
 def assess_file(wx: WorkbookXray, tabs: list["TabAssessment"],
-                 tab_index: dict[str, TabFacts]) -> FileAssessment:
+                 tab_index: dict[str, TabFacts],
+                 read_by: dict[str, set] | None = None) -> FileAssessment:
     """Populate the file-level fields, grounded in the evidence plus the
     already-computed tab-level roles/categories."""
     t = _totals(wx)
@@ -487,7 +481,7 @@ def assess_file(wx: WorkbookXray, tabs: list["TabAssessment"],
     fa.file_id = Field.extracted(wx.sha256[:12], ["content hash (stable across renames)"])
     fa.file_name = Field.extracted(wx.filename)
     fa.complexity = _complexity(wx, t)
-    fa.key_inputs = _key_inputs(wx, tab_index)
+    fa.key_inputs = _key_inputs(wx, tab_index, read_by or {})
     fa.source_system = _source_system(wx)
     fa.euc_preparer = _euc_preparer(wx)
     fa.key_outputs = _key_outputs(tabs)
@@ -495,6 +489,8 @@ def assess_file(wx: WorkbookXray, tabs: list["TabAssessment"],
     # Fact Assessment — deferred (narrative fields filled by the assessor step)
     fa.purpose_of_file = Field.pending("needs_llm", "narrative from structure + headers")
     fa.key_output_outcome = Field.pending("needs_llm", "business outcome the model supports")
+    fa.process = Field.pending("needs_llm", "identify only when supported by workbook evidence")
+    fa.sub_process = Field.pending("needs_llm", "identify only when supported by workbook evidence")
     fa.usage_frequency = Field.needs_human(
         "How often is this workbook used (e.g. daily/monthly/quarterly/ad hoc)?",
         ["not knowable from workbook structure"])
@@ -699,22 +695,17 @@ def _tab_key_calc(s, tf: TabFacts | None) -> Field:
     fp = s.formula_profile
     if not fp.get("total"):
         return Field.extracted([], ["tab has no formulas"])
-    shapes = [f"{sk}  (×{n})" for sk, n in fp.get("top_skeletons", [])[:6]]
-    fns = [f"{fn}×{n}" for fn, n in fp.get("top_functions", [])[:8]]
     desc = rr.business_calculation_description(s, tf)
-    value = {"top_functions": fns, "top_formula_shapes": shapes,
-             "business_description": desc}
-    ev = [f"{fp['total']} formulas, {fp.get('distinct_skeletons', 0)} distinct shapes"]
-    if desc:
-        ev.append("business description is plain-language; formula shapes above remain "
-                  "the technical evidence")
+    value = {"business_description": desc or
+             "Formula calculations are present; the business purpose is not established from structure."}
+    ev = ["plain-language business description only; formula patterns remain in the technical appendix"]
     return Field.extracted(value, ev)
 
 
 def _tab_upstream(s, wx, reads_set: set, tab_index: dict[str, TabFacts]) -> Field:
     """Separate what this tab depends on into in-workbook sheets, lookup/mapping
-    tables, data connections and external workbooks (filename only; full path
-    kept as evidence) — never a wall of raw paths."""
+    tables, data connections and external workbooks, without exposing local
+    paths or claiming that links can be assigned to a specific source."""
     in_workbook = sorted(reads_set)
     lookup_tables = [r for r in in_workbook
                      if "Mapping" in (set(tab_index[r].roles) if r in tab_index else set())]
@@ -722,19 +713,15 @@ def _tab_upstream(s, wx, reads_set: set, tab_index: dict[str, TabFacts]) -> Fiel
 
     external: list[dict] = []
     if s.formula_profile.get("external_count", 0):
-        if wx.external_links:
-            external = [{"file_name": rr.shorten_external(x), "full_path_evidence": x}
-                       for x in wx.external_links]
-        else:
-            external = [{"file_name": "unresolved external reference",
-                        "full_path_evidence": None}]
+        external = [{"file_name": "External workbook reference",
+                     "source_status": "Observed on this worksheet; exact workbook not determinable"}]
 
     uses_connection = bool(wx.connections) and (
         s.formula_profile.get("total", 0) > 0
         or any(p.split("!", 1)[0] == s.name for p in wx.pivot_cache_sources)
     )
-    data_conn = ([c.get("name") or c.get("type") or "unnamed connection"
-                 for c in wx.connections] if uses_connection else [])
+    data_conn = ([f"Formal data connection {i + 1}"
+                  for i, _ in enumerate(wx.connections)] if uses_connection else [])
 
     value = {
         "in_workbook_sheets": other_sheets or ["none"],
@@ -747,8 +734,7 @@ def _tab_upstream(s, wx, reads_set: set, tab_index: dict[str, TabFacts]) -> Fiel
                                        "connection or external dependency detected"])
     return Field.extracted(
         value,
-        ["dependencies grouped by kind; external workbooks are shown by filename only, "
-         "with the full path retained as evidence"],
+        ["dependencies grouped by kind; private source paths and connection strings are excluded"],
     )
 
 
@@ -807,8 +793,8 @@ def _human_validation(s, tab_index: dict[str, TabFacts]) -> tuple[Field, Field]:
         tech.append(f"{fp['volatile_count']} volatile function(s)")
 
     recon = rr.reconciliation_detail(s)
-    if "question" in recon:
-        reasons.append(recon["question"])
+    if "reviewer_question" in recon:
+        reasons.append(recon["reviewer_question"])
         tech.append("lookup/variance logic present but source/target/key not "
                     "resolvable from headers")
 
@@ -821,9 +807,11 @@ def _human_validation(s, tab_index: dict[str, TabFacts]) -> tuple[Field, Field]:
         tech.append("tab category confidence below threshold")
 
     manual = rr.manual_intervention_tab(s)
-    if manual["basis"] == "needs_human" and fp.get("total", 0) == 0 and s.populated_cells > 20:
+    manual_label_evidence = manual.get("evidence") or []
+    if (manual["basis"] == "needs_human" and fp.get("total", 0) == 0
+            and s.populated_cells > 20 and manual_label_evidence):
         reasons.append(manual["question"])
-        tech.append("no formulas — manual-entry area, workflow not confirmed")
+        tech.append("manual-entry label observed; actual workflow requires owner confirmation")
 
     required = bool(reasons)
     yn = Field.derived(
@@ -891,6 +879,40 @@ def _apply_narrative(a: Assessment, narr, basis: str, label: str) -> None:
 
     put(a.file.purpose_of_file, narr.purpose_of_file)
     put(a.file.key_output_outcome, narr.key_output_outcome)
+    # Accept process labels only when the assessor supplies exact source text
+    # that occurs in the structural evidence bundle.
+    business_evidence = {
+        str(item).casefold()
+        for item in getattr(narr, "_evidence_bundle", {}).get("business_evidence", [])
+    }
+    generic_terms = {
+        "input", "output", "calculation", "model", "data", "summary", "report",
+        "dashboard", "working", "worksheet", "table", "amount", "date", "total",
+        "formula", "sheet", "unknown", "general", "euc",
+    }
+    def supported_evidence(items):
+        if not items:
+            return False
+        for item in items:
+            exact = str(item).strip().casefold()
+            terms = {token.casefold() for token in re.findall(r"[A-Za-z][A-Za-z0-9&/-]*", exact)}
+            if exact not in business_evidence or not (terms - generic_terms):
+                return False
+        return True
+    for fld, value, evidence in (
+        (a.file.process, getattr(narr, "process", None), getattr(narr, "process_evidence", [])),
+        (a.file.sub_process, getattr(narr, "sub_process", None), getattr(narr, "sub_process_evidence", [])),
+    ):
+        supported = bool(value and supported_evidence(evidence))
+        if supported:
+            put(fld, value)
+            fld.evidence = ev + [f"source evidence: {item}" for item in evidence]
+        else:
+            fld.value = "Not established — confirm with the process owner"
+            fld.basis = "needs_human"
+            fld.confidence = None
+            fld.evidence = ["No direct supporting workbook evidence was supplied",
+                            "reviewer question: What business process and sub-process does this workbook support?"]
     for ta in a.tabs:
         put(ta.tab_purpose_description, narr.tabs.get(ta.tab_name.value))
 
@@ -940,7 +962,7 @@ def assess(wx: WorkbookXray, assessor=None) -> Assessment:
     ]
     tabs = _order_visible_first(tabs)
 
-    fa = assess_file(wx, tabs, tab_index)
+    fa = assess_file(wx, tabs, tab_index, read_by)
     review = ReviewFindings(
         error_groups=rr.build_error_groups(wx, tab_index, read_by),
         macro_details=fa.macros_vba_external_links.value,
@@ -951,14 +973,30 @@ def assess(wx: WorkbookXray, assessor=None) -> Assessment:
     review.error_details = rr.error_detail_rows(review.error_groups)
     review.hidden_summary = rr.build_hidden_summary(wx, tab_index, read_by)
 
-    a = Assessment(file=fa, tabs=tabs, review=review)
+    a = Assessment(file=fa, tabs=tabs, review=review, scan={
+        "status": wx.parse_status,
+        "error": (safe_scan_message("; ".join(wx.warnings[:3]) or
+                                    "Workbook scan was partial; review diagnostics.", wx.path)
+                   if wx.parse_status == "partial" else None),
+        "total_sheets": len(wx.sheets),
+        "hidden_sheets": sum(s.state != "visible" for s in wx.sheets),
+    })
 
     assessor = assessor or OfflineAssessor()
-    narr = assessor.narrate(build_bundle(a, wx))
+    evidence_bundle = build_bundle(a, wx)
+    narr = assessor.narrate(evidence_bundle)
+    narr._evidence_bundle = evidence_bundle
     _apply_narrative(a, narr, assessor.basis, assessor.label)
+    for candidate in a.review.simplification_candidates + a.review.automation_candidates:
+        candidate["process"] = fa.process.value
+        candidate["sub_process"] = fa.sub_process.value
     return a
 
 
 def to_dict(a: Assessment) -> dict:
-    return {"file": asdict(a.file), "tabs": [asdict(t) for t in a.tabs],
-            "review": asdict(a.review)}
+    file_data = asdict(a.file)
+    # Keep one controlled Logic Types output; the internal primary score is
+    # not exported as a duplicate singular "Logic Type" field.
+    file_data.pop("logic_type", None)
+    return {"scan": a.scan, "file": file_data,
+            "tabs": [asdict(t) for t in a.tabs], "review": asdict(a.review)}

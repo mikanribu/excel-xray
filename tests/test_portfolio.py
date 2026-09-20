@@ -10,9 +10,11 @@ from pathlib import Path
 
 import openpyxl
 
-from excel_xray.portfolio import (DB_NAME, EXCEL_NAME, SUMMARY_NAME, _compare,
+from excel_xray.portfolio import (DB_NAME, EXCEL_NAME, SUMMARY_NAME, SUMMARY_COLUMNS,
+                                  _compare, _safe_scan_error, _store_success, summary_rows,
                                   assessment_from_json, bundle, connect,
                                   scan_portfolio, source_is_current, write_excel)
+from excel_xray import assess
 from excel_xray.report import build_report
 from excel_xray.scan import xray_workbook
 
@@ -32,9 +34,21 @@ def test_portfolio_one_file_row_per_euc_and_tab_drilldown(tmp_path):
     assert len(rows) == 2
     assert {r["File Name"] for r in rows} == {Path(p).name for p in paths}
     assert all(r["File ID"] and r["Scan Status"] == "full" for r in rows)
+    assert "No. of Sheets - Total" in rows[0]
+    assert "No. of Sheets - Hidden" in rows[0]
+    assert not {"Source Path", "Size Bytes", "SHA256"} & set(rows[0])
+    assert not any(str(tmp_path) in str(value) for row in rows for value in row.values())
+    assert "Process" in rows[0] and "Sub-Process" in rows[0]
     wb = openpyxl.load_workbook(tmp_path / EXCEL_NAME, read_only=True)
     assert wb.sheetnames == ["File summary", "Worksheet details", "Diagnostics", "Portfolio findings"]
-    assert sum(1 for _ in wb["File summary"].values) == 3
+    file_summary_rows = list(wb["File summary"].values)
+    assert len(file_summary_rows) == 3
+    summary_headers = set(file_summary_rows[0])
+    assert "No. of Sheets - Total" in summary_headers
+    assert "No. of Sheets - Hidden" in summary_headers
+    assert {"Process", "Sub-Process", "Logic Types"} <= summary_headers
+    assert not {"Source Path", "Size Bytes", "SHA256", "Logic Type"} & summary_headers
+    assert not any(str(tmp_path) in str(value) for row in file_summary_rows for value in row)
     assert sum(1 for _ in wb["Worksheet details"].values) == 16
     with connect(tmp_path) as db:
         assert db.execute("SELECT COUNT(*) FROM tabs").fetchone()[0] == 15
@@ -43,6 +57,33 @@ def test_portfolio_one_file_row_per_euc_and_tab_drilldown(tmp_path):
         a = assessment_from_json(row["assessment_json"])
         html = build_report(xray_workbook(row["source_path"]), a)
         assert "EUC assessment" in html
+
+
+def test_failed_scan_error_is_concise_and_does_not_expose_path_or_credentials(tmp_path):
+    path = str(tmp_path / "private" / "corrupt.xlsx")
+    message = _safe_scan_error(ValueError(f"cannot read {path}; password=secret"), path)
+    assert "corrupt.xlsx" in message
+    assert path not in message
+    assert "secret" not in message
+    assert "password=[redacted]" in message
+    assert "Source Path" not in SUMMARY_COLUMNS
+    assert "SHA256" not in SUMMARY_COLUMNS
+
+
+def test_partial_scan_reason_is_in_summary_without_source_path(tmp_path):
+    source = str(FIXTURES / "messy_reserving_model.xlsx")
+    wx = xray_workbook(source)
+    wx.parse_status = "partial"
+    wx.warnings.append(f"Could not finish scanning {source}")
+    a = assess(wx)
+    with connect(tmp_path) as db:
+        _store_success(db, source, wx, a)
+        row = next(summary_rows(db))
+        assert row[3] == "partial"
+        assert "Could not finish scanning" in row[4]
+        assert source not in row[4]
+        assert "partial" in a.scan["status"]
+        assert source not in (a.scan["error"] or "")
 
 
 def test_selected_bundle_contains_only_selected_original_and_analysis(tmp_path):

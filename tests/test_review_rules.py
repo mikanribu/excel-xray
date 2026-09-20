@@ -83,13 +83,13 @@ def test_hidden_sheets_never_drive_retirement():
     assert a.review.hidden_summary["hidden_count"] >= 1
     rt = a.file.potential_retirement
     assert rt.basis == "needs_human"
-    assert rt.value["verdict"] == "Not established — owner decision required."
+    assert rt.value["verdict"] == "Not established — confirm with the process owner."
     assert "hidden" not in rt.value["verdict"].lower()
 
 
 def test_retirement_assessment_never_cites_structural_signals_as_evidence():
     d = retirement_assessment()
-    assert d["verdict"] == "Not established — owner decision required."
+    assert d["verdict"] == "Not established — confirm with the process owner."
     assert {"active usage", "owner", "recipients", "replacement coverage",
             "regulatory or retention requirements"} <= set(d["confirmation_needed"])
 
@@ -146,7 +146,8 @@ def test_multiple_logic_types_detected_and_joined_into_business_area():
     a = _assess("complex_euc_model.xlsx")
     types = a.file.logic_types.value
     assert len(types) >= 2
-    assert "Mapping" in types  # LOB_Mapping tab carries the Mapping role
+    assert "Data Transformation" in types  # mapping is a data-transformation activity
+    assert "Mapping" not in types
     for t in types:
         assert t in a.file.business_area_process.value or True  # area is a join, not per-type lookup
     assert ";" in a.file.business_area_process.value or len(types) == 1
@@ -158,17 +159,48 @@ def test_multiple_logic_types_detected_and_joined_into_business_area():
 def test_key_inputs_grouped_not_a_flat_list():
     a = _assess("complex_euc_model.xlsx")
     grouped = a.file.key_inputs.value
-    assert set(grouped) == {
+    assert {
         "in_workbook_sheets", "lookup_mapping_tables", "data_connections",
         "external_workbooks", "other_unresolved_sources",
-    }
+    } <= set(grouped)
     assert "LOB_Mapping" in grouped["lookup_mapping_tables"]
+    assert not any("full_path" in item for item in grouped["source_details"])
 
 
-def test_external_workbook_shown_by_filename_with_full_path_as_evidence():
+def test_external_workbook_name_is_normalized_without_paths_or_url_secrets():
     long_path = r"C:\Users\jsmith\Documents\Finance\2024\Q4\Trial Balance FINAL v3.xlsx"
     assert shorten_external(long_path) == "Trial Balance FINAL v3.xlsx"
     assert shorten_external("https://example.com/reports/exchange_rates.xlsx") == "exchange_rates.xlsx"
+    assert shorten_external("https://example.com/Trial%20Balance.xlsx?token=secret#Sheet1") == "Trial Balance.xlsx"
+    assert classify_input_purpose("TB_Jan.xlsx") == "Trial balance"
+
+
+def test_external_input_names_are_deduplicated_with_reference_counts(xray):
+    import json
+    from excel_xray.review_rules import TabFacts, group_key_inputs, visibility_of
+
+    xray.external_links = [
+        r"C:\\private\\finance\\Trial Balance.xlsx",
+        "https://files.example/Trial%20Balance.xlsx?token=secret#Sheet1",
+    ]
+    assessment = assess(xray)
+    tab_index = {
+        tab.tab_name.value: TabFacts(
+            name=tab.tab_name.value, position=position,
+            visibility=tab.tab_visibility.value, category=tab.tab_category.value,
+            roles=tab.tab_roles.value, information=tab.tab_information_analysis.value,
+        )
+        for position, tab in enumerate(assessment.tabs)
+    }
+    grouped = group_key_inputs(xray, tab_index)
+    sources = [source for source in grouped["source_details"]
+               if source["source_type"] == "External workbook"]
+    assert len(sources) == 1
+    assert sources[0]["business_purpose"] == "Trial balance"
+    assert sources[0]["source_name"] == "Trial Balance.xlsx"
+    assert sources[0]["reference_count"] == 2
+    assert sources[0]["consuming_worksheets"] == "Not determinable from workbook structure"
+    assert "secret" not in json.dumps(grouped)
 
 
 def test_input_purpose_classification():
@@ -177,6 +209,33 @@ def test_input_purpose_classification():
     assert classify_input_purpose("Chart of Accounts Mapping.xlsx") == "Account mapping"
     assert classify_input_purpose("FX_Rates_Dec.xlsx") == "Exchange rates"
     assert classify_input_purpose("random_file_9182.xlsx") == "Unclassified — requires review"
+
+
+def test_lookup_formula_alone_does_not_create_a_reconciliation_candidate():
+    from types import SimpleNamespace
+    from excel_xray.review_rules import reconciliation_detail
+
+    sheet = SimpleNamespace(name="Mapping", formula_profile={"top_functions": [("VLOOKUP", 20)]},
+                            regions=[])
+    assert reconciliation_detail(sheet) == {"status": "not_detected"}
+
+
+def test_reconciliation_headers_and_difference_signal_remain_a_candidate():
+    from types import SimpleNamespace
+    from excel_xray.review_rules import reconciliation_detail
+
+    region = SimpleNamespace(headers=["Source", "Target", "Account ID", "Difference"])
+    sheet = SimpleNamespace(
+        name="Reconciliation",
+        formula_profile={"top_functions": [("ABS", 3)]},
+        regions=[region],
+    )
+    detail = reconciliation_detail(sheet)
+    assert detail["status"] == "candidate — owner confirmation required"
+    assert detail["source"] == "Source"
+    assert detail["comparison_target"] == "Target"
+    assert detail["matching_key"] == "Account ID"
+    assert detail["agreement_evidence"] == "not established from workbook structure"
 
 
 # --------------------------------------------------------- downstream roles
