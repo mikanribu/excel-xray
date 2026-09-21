@@ -315,6 +315,18 @@ normalised formula shapes, never cell values) is sent to the model — the same
 holds for the estate insight layer's `ClaudeEstateAssessor` /
 `OpenAIEstateAssessor` below.
 
+For a folder of EUCs, enable OpenAI narrative analysis on the consolidated
+portfolio run with:
+
+```bash
+uv sync --extra llm
+uv run excel-xray inputs/ -o out/ --llm --provider openai
+```
+
+Set `OPENAI_API_KEY` in the shell running the command or in the project-root
+`.env` file. If using `.env.example`, uncomment and fill its OpenAI key line.
+The run still produces one consolidated `portfolio_review.xlsx` for the folder.
+
 ## Estate comparison
 
 `--estate` is the older, separate estate-analysis mode. Over a folder it
