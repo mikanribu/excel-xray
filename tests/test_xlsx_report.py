@@ -81,7 +81,8 @@ def test_cli_defaults_to_xlsx(tmp_path, fixture_path):
     out = tmp_path / "out"
     out.mkdir()
     subprocess.run(
-        [sys.executable, "-m", "excel_xray", fixture_path, "-o", str(out)],
+        [sys.executable, "-m", "excel_xray", fixture_path, "-o", str(out),
+         "--no-email-report"],
         check=True, capture_output=True, text=True,
     )
     files = list(out.glob("**/*.xlsx"))

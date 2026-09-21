@@ -72,30 +72,35 @@ No API key or model service is needed for the default offline assessment.
 
 ### Email the Excel report
 
-Email delivery is opt-in. A folder scan sends the single consolidated
+Excel report delivery is automatic. A folder scan sends its single consolidated
 `portfolio_review.xlsx`; a one-workbook scan sends its generated Excel report.
-It never sends one message per EUC. The default recipient is
-`jacobweglarz@gmail.com`, and `--email-to` can override it.
+An `--estate` folder run sends the estate comparison workbook. The default is one
+email addressed to `jacobweglarz@gmail.com` and `clementine.pages@gmail.com`.
+Use `--email-to` with a comma-separated list to change recipients. Pass
+`--no-email-report` to keep the report local. Folder runs using
+`--individual-reports` must opt out because they create multiple separate files.
 
 Set `GMAIL_ADDRESS` to the Gmail account that will send the report and
 `GMAIL_APP_PASSWORD` to an [App Password](https://support.google.com/accounts/answer/2461835)
 created for that account. Google requires 2-Step Verification for App Passwords.
-Use an App Password instead of your normal Google password, and keep it in your
-shell environment or a local secret manager; do not commit it to the repository.
+Use an App Password instead of your normal Google password. Add both values to
+your local, git-ignored `.env` file or export them in the shell; do not commit
+them to the repository. With the `[llm]` extra installed, the CLI loads `.env`
+automatically for both LLM and email credentials.
 The sender uses Gmail's encrypted SMTP service at `smtp.gmail.com`.
 
 ```bash
-export GMAIL_ADDRESS="your-sender@gmail.com"
-export GMAIL_APP_PASSWORD="your-16-character-app-password"
+GMAIL_ADDRESS=your-sender@gmail.com
+GMAIL_APP_PASSWORD=your-16-character-app-password
 
-# One message with the consolidated workbook for the whole folder
-uv run excel-xray inputs/ -o out/ --email-report
+# One message with the consolidated workbook for the whole folder (default)
+uv run excel-xray inputs/ -o out/
 
-# Send to a different reviewer
-uv run excel-xray inputs/ -o out/ --email-report --email-to reviewer@example.com
+# Send to a different reviewer list
+uv run excel-xray inputs/ -o out/ --email-to reviewer@example.com,finance@example.com
 
-# One workbook: send its individual Excel report
-uv run excel-xray "inputs/one-euc.xlsx" -o out/ --email-report
+# Keep this run's workbook local
+uv run excel-xray inputs/ -o out/ --no-email-report
 ```
 
 The report is generated locally even if email delivery fails; the command then

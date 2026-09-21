@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import os
 import smtplib
+from collections.abc import Iterable
 from email.message import EmailMessage
-from email.utils import parseaddr
+from email.utils import getaddresses
 from pathlib import Path
 
 
-DEFAULT_RECIPIENT = "jacobweglarz@gmail.com"
+DEFAULT_RECIPIENTS = (
+    "jacobweglarz@gmail.com",
+    "clementine.pages@gmail.com",
+)
+DEFAULT_RECIPIENT = ", ".join(DEFAULT_RECIPIENTS)
 SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 465
 # A 17 MiB source file stays below Gmail's message-size limit after MIME
@@ -24,7 +29,7 @@ class EmailDeliveryError(RuntimeError):
 def send_excel_report(
     report_path: str | Path,
     *,
-    recipient: str = DEFAULT_RECIPIENT,
+    recipient: str | Iterable[str] | None = None,
     sender: str | None = None,
     app_password: str | None = None,
 ) -> None:
@@ -54,14 +59,25 @@ def send_excel_report(
             "Use a Google App Password; do not use your regular account password."
         )
 
-    clean_recipient = parseaddr(recipient)[1]
-    if not clean_recipient or "@" not in clean_recipient:
-        raise EmailDeliveryError(f"Invalid email recipient: {recipient}")
+    if recipient is None:
+        recipient_values = list(DEFAULT_RECIPIENTS)
+    elif isinstance(recipient, str):
+        recipient_values = [recipient]
+    else:
+        recipient_values = list(recipient)
+    clean_recipients = tuple(
+        dict.fromkeys(address for _, address in getaddresses(recipient_values))
+    )
+    if not clean_recipients or any(
+        not address or "@" not in address or "\n" in address or "\r" in address
+        for address in clean_recipients
+    ):
+        raise EmailDeliveryError("Invalid email recipient list")
 
     message = EmailMessage()
     message["Subject"] = f"Excel X-ray report: {path.name}"
     message["From"] = sender
-    message["To"] = clean_recipient
+    message["To"] = ", ".join(clean_recipients)
     message.set_content(
         "The generated Excel X-ray report is attached.\n\n"
         "Review the workbook before sharing it further; it may contain sensitive "
@@ -81,6 +97,6 @@ def send_excel_report(
     try:
         with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=30) as smtp:
             smtp.login(sender, app_password)
-            smtp.send_message(message)
+            smtp.send_message(message, to_addrs=list(clean_recipients))
     except (OSError, smtplib.SMTPException) as exc:
         raise EmailDeliveryError(f"Gmail could not send the Excel report: {exc}") from exc

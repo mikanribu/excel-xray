@@ -142,34 +142,38 @@ def main() -> int:
                     help="for a folder, retain the legacy one-report-per-EUC output")
     ap.add_argument("--resume", metavar="RUN_DIR", default=None,
                     help="resume a portfolio run, reusing unchanged scanned EUCs")
-    ap.add_argument("--email-report", action="store_true",
-                    help="email the generated Excel report to --email-to (opt-in; "
-                         "requires GMAIL_ADDRESS and GMAIL_APP_PASSWORD)")
-    ap.add_argument("--email-to", default=DEFAULT_RECIPIENT, metavar="ADDRESS",
-                    help=f"report recipient when --email-report is used "
+    email_group = ap.add_mutually_exclusive_group()
+    email_group.add_argument("--email-report", dest="email_report", action="store_true",
+                             help="email the generated Excel report (default)")
+    email_group.add_argument("--no-email-report", dest="email_report", action="store_false",
+                             help="keep the generated Excel report local")
+    ap.set_defaults(email_report=True)
+    ap.add_argument("--email-to", default=DEFAULT_RECIPIENT, metavar="ADDRESSES",
+                    help="comma-separated report recipients "
                          f"(default: {DEFAULT_RECIPIENT})")
     args = ap.parse_args()
 
-    if args.email_report:
+    email_requested_explicitly = "--email-report" in sys.argv[1:]
+    creates_excel_report = not args.json and not args.assess and args.format == "xlsx"
+    send_email = args.email_report and creates_excel_report
+    if email_requested_explicitly:
         if args.json or args.assess:
             ap.error("--email-report requires an Excel report; it cannot be combined with --json or --assess")
         if args.format != "xlsx":
             ap.error("--email-report requires --format xlsx")
-        if os.path.isdir(args.target) and (args.individual_reports or args.estate):
-            ap.error("--email-report for folders requires the consolidated portfolio run; "
-                     "remove --individual-reports and --estate")
-    elif args.email_to != DEFAULT_RECIPIENT:
-        ap.error("--email-to can only be used with --email-report")
+    if send_email and os.path.isdir(args.target) and args.individual_reports:
+        ap.error("automatic email needs one report; use the consolidated portfolio run "
+                 "or pass --no-email-report with --individual-reports")
+    if not args.email_report and args.email_to != DEFAULT_RECIPIENT:
+        ap.error("--email-to cannot be used with --no-email-report")
 
-    if args.llm:
-        # Load a local .env so ANTHROPIC_API_KEY / OPENAI_API_KEY /
-        # AZURE_OPENAI_* can live there. Best-effort: python-dotenv ships
-        # with the [llm] extra, so this is a no-op otherwise.
-        try:
-            from dotenv import load_dotenv
-            load_dotenv()
-        except ImportError:
-            pass
+    # Load a local .env for LLM and automatic email credentials. Best-effort:
+    # python-dotenv ships with the [llm] extra.
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        pass
 
     args.azure_endpoint = args.azure_endpoint or os.environ.get("AZURE_OPENAI_ENDPOINT")
     args.api_version = args.api_version or os.environ.get("AZURE_OPENAI_API_VERSION")
@@ -206,7 +210,7 @@ def main() -> int:
         print(f"Portfolio ready: {run_dir} ({result['stored']} EUCs; "
               f"{result['failed']} failed; {result['reused']} reused)", file=sys.stderr)
         print(f"Open with: excel-xray serve '{run_dir}'", file=sys.stderr)
-        if args.email_report:
+        if send_email:
             try:
                 report_path = os.path.join(run_dir, "portfolio_review.xlsx")
                 send_excel_report(report_path, recipient=args.email_to)
@@ -338,17 +342,21 @@ def main() -> int:
     for cat, files in sorted(reasons.items()):
         print(f"  {cat:12} {len(files):3}  {', '.join(files[:4])}"
               + (" ..." if len(files) > 4 else ""), file=sys.stderr)
-    if args.email_report:
-        if len(generated_reports) != 1:
+    if send_email:
+        if estate is not None:
+            report_to_send = os.path.join(outdir, f"estate.{ext}")
+        elif len(generated_reports) == 1:
+            report_to_send = generated_reports[0]
+        else:
             print("email failed: expected exactly one generated Excel report, "
                   f"found {len(generated_reports)}", file=sys.stderr)
             return 1
         try:
-            send_excel_report(generated_reports[0], recipient=args.email_to)
+            send_excel_report(report_to_send, recipient=args.email_to)
         except EmailDeliveryError as exc:
             print(f"email failed: {exc}", file=sys.stderr)
             return 1
-        print(f"Emailed {os.path.basename(generated_reports[0])} to {args.email_to}",
+        print(f"Emailed {os.path.basename(report_to_send)} to {args.email_to}",
               file=sys.stderr)
     return 0
 

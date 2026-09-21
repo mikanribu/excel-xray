@@ -17,6 +17,7 @@ class FakeSMTP:
         self.timeout = timeout
         self.login_args = None
         self.message = None
+        self.to_addrs = None
         self.instances.append(self)
 
     def __enter__(self):
@@ -28,8 +29,9 @@ class FakeSMTP:
     def login(self, sender, password):
         self.login_args = (sender, password)
 
-    def send_message(self, message):
+    def send_message(self, message, to_addrs=None):
         self.message = message
+        self.to_addrs = to_addrs
 
 
 def test_send_excel_report_attaches_file_and_uses_configured_gmail(monkeypatch, tmp_path):
@@ -43,7 +45,8 @@ def test_send_excel_report_attaches_file_and_uses_configured_gmail(monkeypatch, 
     smtp = FakeSMTP.instances[0]
     assert (smtp.host, smtp.port, smtp.timeout) == ("smtp.gmail.com", 465, 30)
     assert smtp.login_args == ("sender@gmail.com", "app-password")
-    assert smtp.message["To"] == "jacobweglarz@gmail.com"
+    assert smtp.message["To"] == "jacobweglarz@gmail.com, clementine.pages@gmail.com"
+    assert smtp.to_addrs == ["jacobweglarz@gmail.com", "clementine.pages@gmail.com"]
     attachment = list(smtp.message.iter_attachments())[0]
     assert attachment.get_filename() == "portfolio_review.xlsx"
     assert attachment.get_content() == b"excel workbook bytes"
@@ -57,11 +60,12 @@ def test_send_excel_report_reads_credentials_from_environment(monkeypatch, tmp_p
     report = tmp_path / "report.xlsx"
     report.write_bytes(b"xlsx")
 
-    send_excel_report(report, recipient="reviewer@example.com")
+    send_excel_report(report, recipient="reviewer@example.com, clementine@example.com")
 
     smtp = FakeSMTP.instances[0]
     assert smtp.login_args == ("sender@gmail.com", "app-password")
-    assert smtp.message["To"] == "reviewer@example.com"
+    assert smtp.message["To"] == "reviewer@example.com, clementine@example.com"
+    assert smtp.to_addrs == ["reviewer@example.com", "clementine@example.com"]
 
 
 def test_send_excel_report_requires_credentials_without_attempting_smtp(monkeypatch, tmp_path):
@@ -109,9 +113,57 @@ def test_cli_folder_sends_only_the_consolidated_workbook(monkeypatch, tmp_path, 
     monkeypatch.setattr(cli, "send_excel_report", fake_send)
     monkeypatch.setattr(
         "sys.argv",
-        ["excel-xray", str(source_dir), "--email-report"],
+        ["excel-xray", str(source_dir)],
     )
 
     assert cli.main() == 0
-    assert calls == [("portfolio_review.xlsx", "jacobweglarz@gmail.com")]
+    assert calls == [(
+        "portfolio_review.xlsx",
+        "jacobweglarz@gmail.com, clementine.pages@gmail.com",
+    )]
     assert "Emailed portfolio_review.xlsx" in capsys.readouterr().err
+
+
+def test_cli_folder_can_keep_report_local(monkeypatch, tmp_path):
+    from excel_xray import cli
+
+    source_dir = tmp_path / "inputs"
+    source_dir.mkdir()
+    (source_dir / "euc.xlsx").write_bytes(b"source")
+
+    def fake_scan(paths, run_dir, **kwargs):
+        run_dir = Path(run_dir)
+        run_dir.mkdir(parents=True)
+        (run_dir / "portfolio_review.xlsx").write_bytes(b"consolidated")
+        return {"stored": 1, "failed": 0, "reused": 0}
+
+    def unexpected_send(*args, **kwargs):
+        pytest.fail("email should be disabled with --no-email-report")
+
+    monkeypatch.setattr("excel_xray.portfolio.scan_portfolio", fake_scan)
+    monkeypatch.setattr(cli, "send_excel_report", unexpected_send)
+    monkeypatch.setattr("sys.argv", ["excel-xray", str(source_dir), "--no-email-report"])
+
+    assert cli.main() == 0
+
+
+def test_cli_single_workbook_emails_generated_report_by_default(
+    monkeypatch, tmp_path, fixture_path,
+):
+    from excel_xray import cli
+
+    calls = []
+
+    def fake_send(path, *, recipient):
+        calls.append((Path(path).name, recipient))
+
+    monkeypatch.setattr(cli, "send_excel_report", fake_send)
+    monkeypatch.setattr(
+        "sys.argv",
+        ["excel-xray", fixture_path, "-o", str(tmp_path)],
+    )
+
+    assert cli.main() == 0
+    assert len(calls) == 1
+    assert calls[0][0].endswith(".xlsx")
+    assert calls[0][1] == "jacobweglarz@gmail.com, clementine.pages@gmail.com"
