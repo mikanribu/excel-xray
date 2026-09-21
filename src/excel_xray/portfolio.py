@@ -38,7 +38,8 @@ DIAGNOSTICS_NAME = "diagnostics.csv"
 SUMMARY_COLUMNS = ["Record ID", "File ID", "File Name", "Scan Status", "Scan Error",
                    "No. of Sheets - Total", "No. of Sheets - Hidden",
                    "Cached Errors", "Tabs Requiring Review"] + [label for _, _, label in FILE_FIELDS
-                                                               if label not in {"File ID", "File Name"}]
+                                                               if label not in {"File ID", "File Name"}] + [
+                   "Assessment Status", "Assessment Error"]
 TAB_COLUMNS = ["Record ID", "File ID", "File Name", "Tab Name", "Original Position"] + [
     label for _, _, label in TAB_FIELDS if label != "Tab Name"]
 DIAGNOSTIC_COLUMNS = ["Record ID", "File ID", "File Name", "Kind", "Sheet / Group",
@@ -138,6 +139,8 @@ def _store_success(db: sqlite3.Connection, path: str, wx, a) -> None:
     st = os.stat(path)
     summary = {label: fmt_value(getattr(a.file, attr).value)
                for _, attr, label in FILE_FIELDS}
+    summary["Assessment Status"] = a.scan.get("assessment_status") or "complete"
+    summary["Assessment Error"] = a.scan.get("assessment_error") or "N/A"
     fp = fingerprint(wx, a)
     hidden = a.review.hidden_summary
     scan_error = None
@@ -520,10 +523,21 @@ def _safe(value):
 def summary_rows(db, ids=None):
     for r in selected_files(db, ids):
         summary = json.loads(r["summary_json"]) if r["summary_json"] else {}
-        values = [r["id"], r["file_id"], r["file_name"], r["scan_status"],
-                  _display_scan_error(r["scan_error"]), r["sheet_count"], r["hidden_count"],
-                  r["cached_error_count"], r["review_count"]]
-        yield [_safe(v) for v in values + [summary.get(c, "") for c in SUMMARY_COLUMNS[9:]]]
+        failed = r["scan_status"] == "failed"
+        not_assessed = "Not assessed — workbook scan failed"
+        values = [r["id"], r["file_id"] or ("Not available — scan failed" if failed else "Not recorded"),
+                  r["file_name"], r["scan_status"], _display_scan_error(r["scan_error"]),
+                  "Not assessed" if failed else r["sheet_count"],
+                  "Not assessed" if failed else r["hidden_count"],
+                  "Not assessed" if failed else r["cached_error_count"],
+                  "Not assessed" if failed else r["review_count"]]
+        file_fields = [summary.get(c, not_assessed if failed else "Not recorded — rescan to populate")
+                       for c in SUMMARY_COLUMNS[9:-2]]
+        assessment_status = ("Not assessed" if failed else
+                             summary.get("Assessment Status", "Not recorded — rescan to populate"))
+        assessment_error = ("Workbook could not be scanned; see Scan Error." if failed else
+                            summary.get("Assessment Error", "N/A"))
+        yield [_safe(v) for v in values + file_fields + [assessment_status, assessment_error]]
 
 
 def tab_detail_rows(db, ids=None):
@@ -537,7 +551,13 @@ def tab_detail_rows(db, ids=None):
 
 def diagnostic_rows(db, ids=None):
     for f in selected_files(db, ids):
-        base = [f["id"], f["file_id"], f["file_name"]]
+        base = [f["id"], f["file_id"] or ("Not available — scan failed"
+                                            if f["scan_status"] == "failed" else "Not recorded"),
+                f["file_name"]]
+        if f["scan_status"] == "failed":
+            yield [_safe(v) for v in base + ["Scan failure", "Not applicable", "Workbook scan failed", "Not assessed",
+                "Not assessed", "Not assessed", "Not assessed", "Resolve the Scan Error and rescan the workbook.",
+                _display_scan_error(f["scan_error"])]]
         for r in db.execute("SELECT * FROM errors WHERE file_pk=? ORDER BY count DESC", (f["id"],)):
             yield [_safe(v) for v in base + ["Cached error", r["sheet"], r["error_type"], r["count"],
                 r["area_type"], "; ".join(json.loads(r["downstream_json"])),

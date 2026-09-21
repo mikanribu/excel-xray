@@ -129,6 +129,15 @@ reference counts, known worksheet consumers and an explicit owner check for
 source essentiality. Key Inputs labels dependencies in two separate groups:
 other tabs within the same EUC and other EUC workbooks.
 
+If an LLM narrative request fails, the workbook's deterministic checks are
+still saved and the narrative fields use an explicit offline draft; the
+`Assessment Status` and `Assessment Error` columns identify that fallback. If
+the workbook itself cannot be scanned, the summary and diagnostics say
+“Not assessed” and include the scan error instead of showing empty assessment
+cells or zero counts as if the workbook had been checked. Rescan the affected
+workbooks after correcting the underlying error to produce worksheet-level
+results.
+
 Reviewer-facing CSV and Excel exports do not include local source paths, file
 sizes or raw SHA-256 values. Technical formula patterns remain in the
 individual report's formula appendix; the Key calculations field contains

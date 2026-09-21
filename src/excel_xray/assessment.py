@@ -976,7 +976,7 @@ def _apply_narrative(a: Assessment, narr, basis: str, label: str) -> None:
     ev = [f"{basis} by {label}"]
 
     def put(fld, value):
-        if value is not None:
+        if value is not None and (not isinstance(value, str) or value.strip()):
             fld.value = value
             fld.basis = basis
             fld.confidence = 0.7 if basis == "inferred" else 0.4
@@ -987,6 +987,20 @@ def _apply_narrative(a: Assessment, narr, basis: str, label: str) -> None:
 
     put(a.file.purpose_of_file, narr.purpose_of_file)
     put(a.file.key_output_outcome, narr.key_output_outcome)
+    # A partial or malformed model response must not turn the reviewer-facing
+    # fields into empty cells. Keep uncertainty explicit rather than inventing
+    # a purpose or business outcome.
+    for fld, message in (
+        (a.file.purpose_of_file,
+         "Not established — confirm the workbook's business purpose with the process owner."),
+        (a.file.key_output_outcome,
+         "Not established — confirm the final business outcome and recipient with the process owner."),
+    ):
+        if fld.value is None or (isinstance(fld.value, str) and not fld.value.strip()):
+            fld.value = message
+            fld.basis = "needs_human"
+            fld.confidence = None
+            fld.evidence = ["Narrative assessment did not provide a supported answer"]
     # Accept process labels only when the assessor supplies exact source text
     # that occurs in the structural evidence bundle.
     business_evidence = {
@@ -1022,8 +1036,19 @@ def _apply_narrative(a: Assessment, narr, basis: str, label: str) -> None:
             fld.confidence = None
             fld.evidence = ["No direct supporting workbook evidence was supplied",
                             "reviewer question: What business process and sub-process does this workbook support?"]
+    tab_narratives = getattr(narr, "tabs", {}) or {}
     for ta in a.tabs:
-        put(ta.tab_purpose_description, narr.tabs.get(ta.tab_name.value))
+        purpose = tab_narratives.get(ta.tab_name.value) if isinstance(tab_narratives, dict) else None
+        put(ta.tab_purpose_description, purpose)
+        if (ta.tab_purpose_description.value is None or
+                (isinstance(ta.tab_purpose_description.value, str) and
+                 not ta.tab_purpose_description.value.strip())):
+            ta.tab_purpose_description.value = (
+                "Not established — purpose could not be determined from worksheet evidence.")
+            ta.tab_purpose_description.basis = "needs_human"
+            ta.tab_purpose_description.confidence = None
+            ta.tab_purpose_description.evidence = [
+                "Narrative assessment did not provide a supported worksheet purpose"]
 
 
 def _order_visible_first(tabs: list[TabAssessment]) -> list[TabAssessment]:
@@ -1093,10 +1118,31 @@ def assess(wx: WorkbookXray, assessor=None) -> Assessment:
 
     assessor = assessor or OfflineAssessor()
     evidence_bundle = build_bundle(a, wx)
-    narr = assessor.narrate(evidence_bundle)
+    assessment_status = "drafted" if getattr(assessor, "basis", "") == "drafted" else "complete"
+    assessment_error = None
+    reconciliation_assessor = assessor
+    try:
+        narr = assessor.narrate(evidence_bundle)
+    except Exception as exc:
+        # Preserve all deterministic workbook analysis when the external model
+        # is unavailable. Do not retain raw provider exception text because it
+        # can contain request or credential details.
+        assessor = OfflineAssessor()
+        narr = assessor.narrate(evidence_bundle)
+        assessment_status = "partial — offline fallback"
+        assessment_error = (
+            f"AI narrative unavailable ({type(exc).__name__}); deterministic workbook "
+            "analysis and an offline draft were retained.")
+        reconciliation_assessor = None
     narr._evidence_bundle = evidence_bundle
     _apply_narrative(a, narr, assessor.basis, assessor.label)
-    _apply_reconciliation_result(a, assessor, evidence_bundle)
+    if reconciliation_assessor is not None:
+        _apply_reconciliation_result(a, reconciliation_assessor, evidence_bundle)
+    else:
+        a.file.reconciliation_logic.evidence.append(
+            "AI review was unavailable; structural reconciliation checks were retained")
+    a.scan["assessment_status"] = assessment_status
+    a.scan["assessment_error"] = assessment_error
     for candidate in a.review.simplification_candidates + a.review.automation_candidates:
         candidate["process"] = fa.process.value
         candidate["sub_process"] = fa.sub_process.value

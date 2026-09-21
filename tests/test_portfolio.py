@@ -12,7 +12,7 @@ import openpyxl
 
 from excel_xray.portfolio import (DB_NAME, EXCEL_NAME, SUMMARY_NAME, SUMMARY_COLUMNS,
                                   _compare, _safe_scan_error, _store_success, summary_rows,
-                                  assessment_from_json, bundle, connect,
+                                  assessment_from_json, bundle, connect, diagnostic_rows,
                                   scan_portfolio, source_is_current, write_excel)
 from excel_xray import assess
 from excel_xray.report import build_report
@@ -114,6 +114,37 @@ def test_successful_scan_error_is_na_and_real_error_is_retained(tmp_path):
         _store_failure(db, str(corrupt), ValueError("invalid workbook format"))
         row = next(summary_rows(db))
         assert row[4] == "ValueError: invalid workbook format"
+        exported = dict(zip(SUMMARY_COLUMNS, row))
+        assert exported["Assessment Status"] == "Not assessed"
+        assert exported["Assessment Error"] == "Workbook could not be scanned; see Scan Error."
+        assert exported["No. of Sheets - Total"] == "Not assessed"
+        assert exported["Purpose of File"].startswith("Not assessed")
+        assert all(value not in (None, "") for value in row)
+        diagnostic = next(diagnostic_rows(db))
+        assert diagnostic[3] == "Scan failure"
+        assert diagnostic[4] == "Not applicable"
+        assert all(value not in (None, "") for value in diagnostic)
+        assert diagnostic[-1] == "ValueError: invalid workbook format"
+
+
+def test_llm_outage_stores_offline_assessment_instead_of_failed_blank_row(tmp_path):
+    class UnavailableLLM:
+        basis = "inferred"
+        label = "test model"
+
+        def narrate(self, bundle):
+            raise ConnectionError("provider unreachable")
+
+    source = str(FIXTURES / "messy_reserving_model.xlsx")
+    result = scan_portfolio([source], tmp_path / "run", assessor=UnavailableLLM())
+    assert result["scanned"] == 1 and result["failed"] == 0
+    with connect(tmp_path / "run") as db:
+        row = next(summary_rows(db))
+        exported = dict(zip(SUMMARY_COLUMNS, row))
+        assert exported["Scan Status"] == "full"
+        assert exported["Assessment Status"] == "partial — offline fallback"
+        assert "ConnectionError" in exported["Assessment Error"]
+        assert all(value not in (None, "") for value in row)
 
 
 def test_selected_bundle_contains_only_selected_original_and_analysis(tmp_path):

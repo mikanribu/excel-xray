@@ -287,6 +287,25 @@ def test_custom_assessor_marks_fields_inferred(xray):
     assert all(t.tab_purpose_description.basis == "inferred" for t in a.tabs)
 
 
+def test_failed_llm_narrative_keeps_deterministic_assessment_and_marks_fallback(xray):
+    class UnavailableLLM:
+        basis = "inferred"
+        label = "test model"
+
+        def narrate(self, bundle):
+            raise ConnectionError("request failed with api_key=do-not-export")
+
+    a = assess(xray, assessor=UnavailableLLM())
+    assert a.scan["assessment_status"] == "partial — offline fallback"
+    assert "ConnectionError" in a.scan["assessment_error"]
+    assert "do-not-export" not in a.scan["assessment_error"]
+    assert a.tabs
+    assert a.file.purpose_of_file.value.startswith("Not established")
+    assert a.file.key_output_outcome.value.startswith("Not established")
+    assert all(t.tab_purpose_description.value for t in a.tabs)
+    assert all(t.tab_purpose_description.basis == "drafted" for t in a.tabs)
+
+
 def test_parse_json_tolerates_fenced_output():
     from excel_xray.narrative import _parse_json
     assert _parse_json('```json\n{"a": 1}\n```') == {"a": 1}
