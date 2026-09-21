@@ -7,6 +7,7 @@ whole point of this layer is what it does with real workbook structure."""
 from __future__ import annotations
 
 from excel_xray import assess, xray_workbook
+from excel_xray.tabular import fmt_value
 from excel_xray.review_rules import (
     classify_input_purpose,
     duplication_corpus_note,
@@ -164,6 +165,10 @@ def test_key_inputs_grouped_not_a_flat_list():
         "external_workbooks", "other_unresolved_sources",
     } <= set(grouped)
     assert "LOB_Mapping" in grouped["lookup_mapping_tables"]
+    assert "other_tabs_within_this_euc" in grouped
+    assert "other_eucs" in grouped
+    assert "Other tabs within this EUC:" in fmt_value(grouped)
+    assert "Other EUCs:" in fmt_value(grouped)
     assert not any("full_path" in item for item in grouped["source_details"])
 
 
@@ -172,7 +177,21 @@ def test_external_workbook_name_is_normalized_without_paths_or_url_secrets():
     assert shorten_external(long_path) == "Trial Balance FINAL v3.xlsx"
     assert shorten_external("https://example.com/reports/exchange_rates.xlsx") == "exchange_rates.xlsx"
     assert shorten_external("https://example.com/Trial%20Balance.xlsx?token=secret#Sheet1") == "Trial Balance.xlsx"
+    assert shorten_external("FX 100% rates.xlsx") == "FX 100 rates.xlsx"
     assert classify_input_purpose("TB_Jan.xlsx") == "Trial balance"
+
+
+def test_rationalization_fields_format_similarities_and_differences_for_review():
+    from excel_xray.tabular import fmt_value
+
+    value = {"verdict": "Potential functional duplication — confirm",
+             "matches": [{"file": "Claims.xlsx",
+                          "functional_similarities": ["same reserve output"],
+                          "material_differences": ["different source system"]}]}
+    rendered = fmt_value(value)
+    assert "Claims.xlsx" in rendered
+    assert "same reserve output" in rendered
+    assert "different source system" in rendered
 
 
 def test_external_input_names_are_deduplicated_with_reference_counts(xray):
@@ -201,6 +220,7 @@ def test_external_input_names_are_deduplicated_with_reference_counts(xray):
     assert sources[0]["reference_count"] == 2
     assert sources[0]["consuming_worksheets"] == "Not determinable from workbook structure"
     assert "secret" not in json.dumps(grouped)
+    assert "%" not in sources[0]["source_name"]
 
 
 def test_input_purpose_classification():
@@ -232,10 +252,11 @@ def test_reconciliation_headers_and_difference_signal_remain_a_candidate():
     )
     detail = reconciliation_detail(sheet)
     assert detail["status"] == "candidate — owner confirmation required"
-    assert detail["source"] == "Source"
-    assert detail["comparison_target"] == "Target"
-    assert detail["matching_key"] == "Account ID"
-    assert detail["agreement_evidence"] == "not established from workbook structure"
+    assert detail["source_a"] == "Source"
+    assert detail["source_b"] == "Target"
+    assert detail["matching_criteria"] == "Account ID"
+    assert detail["tolerance"] == "Not identified from workbook structure"
+    assert detail["exception_logic"] == "Not documented in workbook structure"
 
 
 # --------------------------------------------------------- downstream roles
@@ -286,12 +307,13 @@ def test_duplication_corpus_note_flags_small_populations():
     assert duplication_corpus_note(10) is None
 
 
-def test_corpus_findings_carry_size_and_strongest_candidate():
+def test_corpus_findings_carry_comparison_count_and_shortlist_only():
     from excel_xray.corpus import assess_corpus
     a1 = xray_workbook("tests/fixtures/messy_reserving_model.xlsx")
     a2 = xray_workbook("tests/fixtures/complex_euc_model.xlsx")
     results = assess_corpus([a1, a2])
     dup = results[0].file.potential_duplication
     assert dup.value["corpus_compared"] == 1
-    assert "strongest_candidate" in dup.value
-    assert any("limited to the 1 other workbook" in e for e in dup.evidence)
+    assert "matches" in dup.value
+    assert dup.value["verdict"].startswith("Not established")
+    assert any("1 other workbook(s) compared" in e for e in dup.evidence)

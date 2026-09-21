@@ -15,7 +15,7 @@ import json
 FILE_FIELDS = [
     ("Fact Assessment", "file_id", "File ID"),
     ("Fact Assessment", "file_name", "File Name"),
-    ("Fact Assessment", "business_area_process", "Business Area / Process"),
+    ("Fact Assessment", "business_area_process", "Business Area Purpose"),
     ("Fact Assessment", "process", "Process"),
     ("Fact Assessment", "sub_process", "Sub-Process"),
     ("Fact Assessment", "purpose_of_file", "Purpose of File"),
@@ -75,8 +75,12 @@ def fmt_value(v) -> str:
                 if items:
                     vals = [_candidate_label(x) for x in items]
                     extras.append(f"{k}: " + ", ".join(vals))
+            if v.get("replacement_coverage"):
+                extras.append(f"replacement coverage: {v['replacement_coverage']}")
             s = str(v["verdict"])
             return s + (" — " + "; ".join(extras) if extras else "")
+        if "functional_similarities" in v or "shared_solution" in v:
+            return _candidate_label(v)
         if "business_descriptions" in v or "business_description" in v:
             descs = v.get("business_descriptions") or [v.get("business_description")]
             return "; ".join(str(d) for d in descs if d) or "Not established — confirm with process owner"
@@ -96,39 +100,55 @@ def fmt_value(v) -> str:
                     f"Formal data connections: {count} detected" if count else "Formal data connections: none detected",
                     f"External workbook links: {v.get('external_workbook_links', 0)} reference(s)"]
             return "; ".join(parts)
-        if "resolved" in v or "reviewer_questions" in v or "candidates" in v:  # reconciliation_logic
-            parts = [f"{d['tab']}: {d.get('status')}; source={d.get('source')}; "
-                     f"target={d.get('comparison_target')}; key={d.get('matching_key')}; "
-                     f"agreement={d.get('agreement_evidence')}"
-                     for d in v.get("candidates", []) + v.get("resolved", [])]
+        if "reconciliation_count" in v or "resolved" in v or "reviewer_questions" in v:
+            reconciliations = v.get("reconciliations") or v.get("candidates", []) + v.get("resolved", [])
+            count = v.get("reconciliation_count", len(reconciliations))
+            parts = [f"{count} reconciliation(s) identified"]
+            parts.extend(
+                f"{d.get('worksheet', d.get('tab', 'Worksheet'))}: {d.get('overview', 'comparison')}; "
+                f"Source A={d.get('source_a', d.get('source', 'not established'))}; "
+                f"Source B={d.get('source_b', d.get('comparison_target', 'not established'))}; "
+                f"matching criteria={d.get('matching_criteria', d.get('matching_key', 'not established'))}; "
+                f"tolerance={d.get('tolerance', 'not established')}; "
+                f"exception logic={d.get('exception_logic', 'not established')}"
+                for d in reconciliations
+            )
             parts += v.get("reviewer_questions", [])
-            return "; ".join(parts) or "—"
-        if "in_workbook_sheets" in v:  # key_inputs / upstream_dependencies grouped
-            if v.get("source_details"):
-                return "; ".join(
-                    f"{item.get('business_purpose')}: {item.get('source_type')} "
-                    f"{item.get('source_name')} ({item.get('reference_count', 0)} reference(s)); "
-                    f"consumers: {item.get('consuming_worksheets')}; "
-                    f"status: {item.get('source_status')}; essentiality: {item.get('essentiality')}"
-                    for item in v["source_details"]
-                ) or "No input sources identified"
+            if v.get("status"):
+                parts.append(str(v["status"]))
+            return "; ".join(parts)
+        if "in_workbook_sheets" in v or "other_tabs_within_this_euc" in v:
             parts = []
-            for k in ("in_workbook_sheets", "lookup_mapping_tables", "data_connections",
-                     "other_unresolved_sources"):
+            tabs = v.get("other_tabs_within_this_euc")
+            if tabs is None:
+                tabs = [x for x in (v.get("in_workbook_sheets") or [])
+                        + (v.get("lookup_mapping_tables") or [])
+                        if x not in {"none", "none identified", "none identified as a dedicated input tab"}]
+            other_eucs = v.get("other_eucs")
+            if other_eucs is None:
+                other_eucs = [
+                    {"file_name": file.get("file_name"),
+                     "reference_count": file.get("reference_count", 1)}
+                    for group in v.get("external_workbooks", [])
+                    if isinstance(group, dict)
+                    for file in group.get("files", [])
+                ]
+            if tabs:
+                parts.append("Other tabs within this EUC: " + ", ".join(map(str, tabs)))
+            elif "other_tabs_within_this_euc" in v:
+                parts.append("Other tabs within this EUC: none identified")
+            if other_eucs:
+                parts.append("Other EUCs: " + ", ".join(
+                    f"{item.get('file_name')} ({item.get('reference_count', 1)} reference(s))"
+                    for item in other_eucs if isinstance(item, dict)
+                ))
+            elif "other_eucs" in v or "external_workbooks" in v:
+                parts.append("Other EUCs: none identified")
+            for k, label in (("data_connections", "Formal data connections"),
+                             ("other_unresolved_sources", "Other unresolved sources")):
                 items = v.get(k)
                 if items and items not in (["none"], []):
-                    parts.append(f"{k}: " + ", ".join(_candidate_label(x) for x in items))
-            for group in v.get("external_workbooks") or []:
-                if isinstance(group, dict):
-                    files = group.get("files") or []
-                    names = ", ".join(
-                        f"{x.get('file_name')} ({x.get('reference_count', 1)} reference(s))"
-                        for x in files if isinstance(x, dict)
-                    )
-                    parts.append(f"{group.get('business_purpose', 'External source')}: "
-                                 f"{names or 'none'}; consumers: "
-                                 f"{group.get('consuming_worksheets', 'not established')}; "
-                                 f"essentiality: {group.get('essentiality', 'not established')}")
+                    parts.append(f"{label}: " + ", ".join(_candidate_label(x) for x in items))
             return "; ".join(parts) or "—"
         return json.dumps(v, default=str)
     return str(v)
@@ -137,10 +157,35 @@ def fmt_value(v) -> str:
 def _candidate_label(x) -> str:
     """One short label for a structured list item (candidate/match/consumer)."""
     if isinstance(x, dict):
+        name = None
         for k in ("worksheet", "file", "sheet", "file_name"):
             if k in x:
-                extra = x.get("role") or x.get("verdict") or x.get("current_complexity")
-                return f"{x[k]}" + (f" ({extra})" if extra else "")
+                name = str(x[k])
+                break
+        details = []
+        for key, label in (
+            ("functional_similarities", "similarities"),
+            ("material_differences", "differences"),
+            ("shared_solution", "shared solution"),
+            ("proposed_change", "proposed change"),
+            ("recommendation", "recommendation"),
+            ("candidate_action", "next step"),
+            ("suspected_manual_step", "manual step"),
+            ("observed_manual_step", "manual step"),
+        ):
+            value = x.get(key)
+            if value:
+                rendered = "; ".join(map(str, value)) if isinstance(value, list) else str(value)
+                details.append(f"{label}: {rendered}")
+        blockers = x.get("blockers")
+        if blockers:
+            details.append("blockers: " + "; ".join(map(str, blockers)))
+        if not details:
+            extra = x.get("role") or x.get("verdict") or x.get("current_complexity")
+            if extra:
+                details.append(str(extra))
+        if name is not None:
+            return name + (" — " + "; ".join(details) if details else "")
         return str(x)
     return str(x)
 

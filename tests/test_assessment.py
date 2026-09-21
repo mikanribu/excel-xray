@@ -159,7 +159,64 @@ def test_reconciliation_absent_on_calc_model(xray):
     fa = assess(xray).file
     rl = fa.reconciliation_logic
     assert rl.basis == "derived"
-    assert rl.value == "No reconciliation pattern detected"
+    assert rl.value["reconciliation_count"] == 0
+    assert rl.value["reconciliations"] == []
+
+
+def test_reconciliation_normalizer_counts_three_supported_comparisons():
+    from excel_xray.assessment import _normalise_reconciliation_result
+
+    worksheet = "Reconciliation"
+    pairs = [("Dataset A Balance", "Dataset B Balance"),
+             ("Dataset C Balance", "Dataset D Balance"),
+             ("Dataset E Balance", "Dataset F Balance")]
+    headers = [name for pair in pairs for name in pair] + [
+        "Account ID", "Variance", "Tolerance 0.01%", "Exception comments",
+    ]
+    bundle = {"tabs": [{"name": worksheet, "headers": headers}],
+              "reconciliation_candidates": {"reconciliations": []}}
+    findings = []
+    for source_a, source_b in pairs:
+        findings.append({
+            "worksheet": worksheet,
+            "overview": "model supplied overview is normalized to cited sources",
+            "source_a": source_a,
+            "source_b": source_b,
+            "matching_criteria": "Account ID",
+            "tolerance": "Tolerance 0.01%",
+            "exception_logic": "Exception comments",
+            "evidence": [{"worksheet": worksheet, "text": text}
+                         for text in (source_a, source_b, "Variance", "Account ID",
+                                      "Tolerance 0.01%", "Exception comments")],
+        })
+
+    single = _normalise_reconciliation_result(
+        {"reconciliation_count": 1, "reconciliations": findings[:1]}, bundle)
+    assert single["reconciliation_count"] == 1
+    assert single["reconciliations"][0]["source_a"] == pairs[0][0]
+    assert single["reconciliations"][0]["source_b"] == pairs[0][1]
+    result = _normalise_reconciliation_result(
+        {"reconciliation_count": 3, "reconciliations": findings}, bundle)
+    assert result["reconciliation_count"] == 3
+    assert len(result["reconciliations"]) == 3
+    for item in result["reconciliations"]:
+        assert item["overview"] == f"Compare {item['source_a']} against {item['source_b']}"
+        assert item["matching_criteria"] == "Account ID"
+        assert item["tolerance"] == "Tolerance 0.01%"
+        assert item["exception_logic"] == "Exception comments"
+
+
+def test_reconciliation_details_count_three_independent_regions():
+    from types import SimpleNamespace
+    from excel_xray.review_rules import reconciliation_details
+
+    regions = [SimpleNamespace(headers=[source_a, source_b, "Account ID", "Variance"])
+               for source_a, source_b in (("Source GL", "Target Subledger"),
+                                          ("Dataset A", "Dataset B"),
+                                          ("System A", "System B"))]
+    sheet = SimpleNamespace(name="Reconciliation", regions=regions,
+                            formula_profile={"top_functions": []})
+    assert len(reconciliation_details(sheet)) == 3
 
 
 def test_corpus_findings_still_deferred(xray):
@@ -186,6 +243,8 @@ def test_business_area_derived_from_logic(xray):
     assert fa.business_area_process.basis == "derived"
     assert "Calculation / modelling" in fa.business_area_process.value
     assert "Calculation" in fa.logic_types.value
+    from excel_xray.tabular import FILE_FIELDS
+    assert dict((attr, label) for _, attr, label in FILE_FIELDS)["business_area_process"] == "Business Area Purpose"
 
 
 def test_offline_narrative_is_drafted_and_grounded(xray):
@@ -259,6 +318,30 @@ def test_process_classification_requires_specific_matching_evidence(xray):
     assert a.file.process.basis == "needs_human"
     assert a.file.sub_process.basis == "needs_human"
     assert a.file.process.value.startswith("Not established")
+
+
+def test_process_and_subprocess_are_separate_evidence_supported_fields(xray):
+    from excel_xray.narrative import Narrative
+
+    class Supported:
+        basis = "inferred"
+        label = "fake model"
+
+        def narrate(self, bundle):
+            assert bundle["process_subprocess_taxonomy"] == []
+            return Narrative(
+                business_use_case="Monthly claims reserve movement and reporting",
+                process="Claims Management",
+                sub_process="Monthly Reserve Movement",
+                process_evidence=["Policy ID"],
+                sub_process_evidence=["Written Premium"],
+            )
+
+    a = assess(xray, assessor=Supported())
+    assert a.file.process.value == "Claims Management"
+    assert a.file.sub_process.value == "Monthly Reserve Movement"
+    assert a.file.process.value != a.file.sub_process.value
+    assert a.file.process.basis == a.file.sub_process.basis == "inferred"
 
 
 def test_scan_metadata_and_logic_taxonomy_export_once(xray):

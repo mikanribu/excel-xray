@@ -36,6 +36,9 @@ def test_portfolio_one_file_row_per_euc_and_tab_drilldown(tmp_path):
     assert all(r["File ID"] and r["Scan Status"] == "full" for r in rows)
     assert "No. of Sheets - Total" in rows[0]
     assert "No. of Sheets - Hidden" in rows[0]
+    assert rows[0]["Scan Error"] == "N/A"
+    assert "Business Area Purpose" in rows[0]
+    assert "Business Area Process" not in rows[0]
     assert not {"Source Path", "Size Bytes", "SHA256"} & set(rows[0])
     assert not any(str(tmp_path) in str(value) for row in rows for value in row.values())
     assert "Process" in rows[0] and "Sub-Process" in rows[0]
@@ -46,7 +49,8 @@ def test_portfolio_one_file_row_per_euc_and_tab_drilldown(tmp_path):
     summary_headers = set(file_summary_rows[0])
     assert "No. of Sheets - Total" in summary_headers
     assert "No. of Sheets - Hidden" in summary_headers
-    assert {"Process", "Sub-Process", "Logic Types"} <= summary_headers
+    assert {"Business Area Purpose", "Process", "Sub-Process", "Logic Types"} <= summary_headers
+    assert "Business Area Process" not in summary_headers
     assert not {"Source Path", "Size Bytes", "SHA256", "Logic Type"} & summary_headers
     assert not any(str(tmp_path) in str(value) for row in file_summary_rows for value in row)
     assert sum(1 for _ in wb["Worksheet details"].values) == 16
@@ -57,6 +61,16 @@ def test_portfolio_one_file_row_per_euc_and_tab_drilldown(tmp_path):
         a = assessment_from_json(row["assessment_json"])
         html = build_report(xray_workbook(row["source_path"]), a)
         assert "EUC assessment" in html
+        from excel_xray.xlsx_report import write_xlsx_report
+        individual = tmp_path / "individual.xlsx"
+        write_xlsx_report(xray_workbook(row["source_path"]), a, str(individual))
+        individual_wb = openpyxl.load_workbook(individual, read_only=True)
+        info = list(individual_wb["Report information"].values)
+        assert ("Scan error", "N/A") in info
+        individual_fields = [r[0] for r in individual_wb["File assessment"].iter_rows(
+            min_row=2, min_col=2, max_col=2, values_only=True)]
+        assert "Business Area Purpose" in individual_fields
+        assert "Business Area Process" not in individual_fields
 
 
 def test_failed_scan_error_is_concise_and_does_not_expose_path_or_credentials(tmp_path):
@@ -84,6 +98,22 @@ def test_partial_scan_reason_is_in_summary_without_source_path(tmp_path):
         assert source not in row[4]
         assert "partial" in a.scan["status"]
         assert source not in (a.scan["error"] or "")
+
+
+def test_successful_scan_error_is_na_and_real_error_is_retained(tmp_path):
+    from excel_xray.portfolio import _display_scan_error, _store_failure
+
+    assert _display_scan_error(None) == "N/A"
+    assert _display_scan_error("") == "N/A"
+    assert _display_scan_error("#REF! could not be read") == "#REF! could not be read"
+    corrupt = tmp_path / "broken.xlsx"
+    corrupt.write_bytes(b"not an OOXML workbook")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    with connect(run_dir) as db:
+        _store_failure(db, str(corrupt), ValueError("invalid workbook format"))
+        row = next(summary_rows(db))
+        assert row[4] == "ValueError: invalid workbook format"
 
 
 def test_selected_bundle_contains_only_selected_original_and_analysis(tmp_path):
@@ -136,6 +166,55 @@ def test_source_change_blocks_original_export(tmp_path):
             pass
         else:
             assert False, "bundle should reject changed originals"
+
+
+def test_identical_workbooks_are_structural_candidates_not_duplicate_findings(tmp_path):
+    first = tmp_path / "first.xlsx"
+    second = tmp_path / "second.xlsx"
+    content = (FIXTURES / "messy_reserving_model.xlsx").read_bytes()
+    first.write_bytes(content)
+    second.write_bytes(content)
+    scan_portfolio([str(first), str(second)], tmp_path / "run")
+    with connect(tmp_path / "run") as db:
+        for row in db.execute("SELECT assessment_json,summary_json FROM files"):
+            assessment = json.loads(row["assessment_json"])
+            value = assessment["file"]["potential_duplication"]["value"]
+            assert value["verdict"].startswith("Not established")
+            assert len(value["matches"]) == 1
+            assert "Not established" in json.loads(row["summary_json"])["Potential Duplication"]
+        assert db.execute("SELECT relationship FROM pairs").fetchone()[0] == "Structural similarity review"
+
+
+def test_portfolio_findings_roll_up_evidence_backed_rationalization(tmp_path):
+    from excel_xray.portfolio import _findings
+
+    with connect(tmp_path) as db:
+        first = db.execute("INSERT INTO files(source_path,file_name,scan_status) VALUES(?,?,?)",
+                           ("/one.xlsx", "one.xlsx", "full")).lastrowid
+        second = db.execute("INSERT INTO files(source_path,file_name,scan_status) VALUES(?,?,?)",
+                            ("/two.xlsx", "two.xlsx", "full")).lastrowid
+        first_assessment = {"file": {
+            "potential_duplication": {"value": {"verdict": "Potential functional duplication — review",
+                "matches": [{"comparison_id": str(second), "file": "two.xlsx"}]}},
+            "similar_duplicate_files": {"value": [{"comparison_id": str(second), "file": "two.xlsx"}]},
+            "potential_simplification": {"value": {"candidates": [{"worksheet": "Calc"}]}},
+            "potential_consolidation": {"value": {"verdict": "Potential consolidation — review",
+                "candidates": [{"comparison_id": str(second), "file": "two.xlsx"}]}},
+            "potential_automation": {"value": {"candidates": [{
+                "worksheet": "Input", "observed_manual_step": "Manual paste of data",
+                "evidence": [{"text": "Manual input"}],
+            }]}},
+            "potential_retirement": {"value": {"verdict": "Potential retirement — owner review"}},
+        }, "tabs": []}
+        db.execute("UPDATE files SET assessment_json=? WHERE id=?",
+                   (json.dumps(first_assessment), first))
+        _findings(db)
+        titles = {row[0] for row in db.execute("SELECT title FROM findings")}
+        assert {
+            "Potential functional duplication", "Similar EUC business use cases",
+            "Potential simplification", "Potential consolidation", "Potential automation",
+            "Potential retirement",
+        } <= titles
 
 
 def test_two_thousand_records_compare_without_individual_reports(tmp_path):

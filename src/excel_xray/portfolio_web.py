@@ -11,12 +11,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlsplit
 
-from .corpus import DUP_THRESHOLD, SIMILAR_THRESHOLD, SKELETON_DUP, similarity
+from .corpus import SIMILAR_THRESHOLD, SKELETON_DUP, similarity
 from .portfolio import (DB_NAME, DIAGNOSTIC_COLUMNS, EXCEL_NAME, FINDING_COLUMNS,
                         SUMMARY_COLUMNS, TAB_COLUMNS, assessment_from_json, bundle,
                         connect, diagnostic_rows, finding_rows, selected_files,
                         summary_rows, tab_detail_rows, write_csv, write_excel,
-                        source_is_current, _restore_fp)
+                        source_is_current, _restore_fp, _display_scan_error)
 from .tabular import fmt_value
 
 DASHBOARD = r"""<!doctype html>
@@ -35,7 +35,7 @@ DASHBOARD = r"""<!doctype html>
  <div class="toolbar"><input id="search" type="search" placeholder="Search file name, process or output" aria-label="Search files"><select id="status" aria-label="Scan status"><option value="">All statuses</option><option value="full">Full</option><option value="partial">Partial</option><option value="failed">Failed</option></select><button class="secondary" id="refresh">Search</button></div>
  <div class="toolbar"><span id="chosen">0 selected</span><button id="compare" class="secondary">Compare selected</button><button id="csv">Summary CSV</button><button id="excel">Review Excel</button><button id="tabs" class="secondary">Tab detail CSV</button><button id="diagnostics" class="secondary">Diagnostics CSV</button><button id="findings-csv" class="secondary">Findings CSV</button><button id="bundle" class="secondary">Originals + analysis ZIP</button></div>
  <p class="muted">Exports use selected EUCs. With none selected, they include every EUC. The ZIP contains original files, so handle it according to your team's data rules.</p>
- <div class="tablewrap"><table><thead><tr><th><input type="checkbox" id="select-page" aria-label="Select visible page"></th><th>File</th><th>Status</th><th>Business Area</th><th>Process</th><th>Sub-Process</th><th>Key output</th><th>No. of Sheets - Total</th><th>No. of Sheets - Hidden</th><th>Errors</th><th>Review</th></tr></thead><tbody id="files"></tbody></table></div>
+ <div class="tablewrap"><table><thead><tr><th><input type="checkbox" id="select-page" aria-label="Select visible page"></th><th>File</th><th>Status</th><th>Business Area Purpose</th><th>Process</th><th>Sub-Process</th><th>Key output</th><th>No. of Sheets - Total</th><th>No. of Sheets - Hidden</th><th>Errors</th><th>Review</th></tr></thead><tbody id="files"></tbody></table></div>
  <div class="pager"><button id="prev" class="secondary">Previous</button><span id="page"></span><button id="next" class="secondary">Next</button></div>
 </section>
 <section class="split"><section class="panel detail"><h2>Individual EUC analysis</h2><div id="detail" class="muted">Choose a file above to see its file assessment, worksheet detail and diagnostics.</div></section><section class="panel"><h2>Comparative review</h2><div id="comparison" class="muted">Select two or more EUCs, then choose Compare selected.</div></section></section>
@@ -45,15 +45,15 @@ const $=id=>document.getElementById(id), selected=new Set();let offset=0,total=0
 function esc(x){return String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function val(f){if(!f)return '—';if(f.display!==undefined)return f.display;const v=f.value;if(v===null||v===undefined)return '—';if(Array.isArray(v))return v.join('; ');if(typeof v==='object')return JSON.stringify(v);return String(v)}
 function short(x,n=150){x=String(x??'—');return x.length>n?x.slice(0,n-1)+'…':x}
-function label(s){return s.replaceAll('_',' ').replace(/\b\w/g,x=>x.toUpperCase())}
+function label(s){if(s==='business_area_process')return 'Business Area Purpose';return s.replaceAll('_',' ').replace(/\b\w/g,x=>x.toUpperCase())}
 async function get(url){const r=await fetch(url);if(!r.ok)throw Error(await r.text());return r.json()}
 function syncSelected(){$('chosen').textContent=`${selected.size} selected`;}
 async function overview(){const d=await get('/api/overview');$('stats').innerHTML=[['Submitted EUCs',d.total],['Scanned',d.scanned],['Cached errors',d.errors],['Hidden sheets',d.hidden]].map(([a,b])=>`<div class="card"><b>${b}</b><span>${a}</span></div>`).join('');$('findings').innerHTML=d.findings.length?`<div class="tablewrap"><table><thead><tr><th>Type</th><th>Finding</th><th>EUCs</th><th>Severity</th><th>Evidence</th><th>Reviewer action</th></tr></thead><tbody>${d.findings.map(f=>`<tr><td>${esc(f.type)}</td><td>${esc(f.title)}</td><td>${f.affected_eucs}</td><td><span class="pill ${f.severity==='High'?'high':''}">${esc(f.severity)}</span></td><td>${esc(f.evidence)}</td><td>${esc(f.action)}</td></tr>`).join('')}</tbody></table></div>`:'No portfolio findings.'}
 async function files(){const q=new URLSearchParams({offset,limit,q:$('search').value,status:$('status').value});const d=await get('/api/files?'+q);total=d.total;pageRows=d.rows;$('files').innerHTML=d.rows.map(r=>`<tr><td><input type="checkbox" data-id="${r.id}" ${selected.has(r.id)?'checked':''} aria-label="Select ${esc(r.file_name)}"></td><td><a href="#" data-open="${r.id}">${esc(r.file_name)}</a><br><small class="muted">${esc(r.file_id||'')}</small></td><td><span class="pill ${r.scan_status!=='full'?'partial':''}">${esc(r.scan_status)}</span></td><td>${esc(r.business_area||'—')}</td><td>${esc(r.process||'—')}</td><td>${esc(r.sub_process||'—')}</td><td title="${esc(r.output||'')}">${esc(short(r.output))}</td><td>${r.sheet_count}</td><td>${r.hidden_count}</td><td>${r.cached_error_count}</td><td>${r.review_count}</td></tr>`).join('');$('page').textContent=`${total?offset+1:0}–${Math.min(total,offset+limit)} of ${total}`;$('prev').disabled=offset===0;$('next').disabled=offset+limit>=total;$('select-page').checked=d.rows.length>0&&d.rows.every(r=>selected.has(r.id));}
-async function detail(id){const d=await get(`/api/files/${id}`);const a=d.assessment;let out=`<div class="actions"><button class="secondary" onclick="window.open('/report/${id}.html','_blank')">Open full HTML report</button><button class="secondary" onclick="location.href='/report/${id}.xlsx'">Download individual Excel</button><button onclick="location.href='/original/${id}'">Download original EUC</button></div><h3>${esc(d.file.file_name)}</h3><p class="muted">Scan status: ${esc(d.file.scan_status)}${d.file.scan_error?' · '+esc(d.file.scan_error):''}</p>`;
+async function detail(id){const d=await get(`/api/files/${id}`);const a=d.assessment;let out=`<div class="actions"><button class="secondary" onclick="window.open('/report/${id}.html','_blank')">Open full HTML report</button><button class="secondary" onclick="location.href='/report/${id}.xlsx'">Download individual Excel</button><button onclick="location.href='/original/${id}'">Download original EUC</button></div><h3>${esc(d.file.file_name)}</h3><p class="muted">Scan status: ${esc(d.file.scan_status)} · Scan error: ${esc(d.file.scan_error||'N/A')}</p>`;
 if(a){const core=['file_id','business_area_process','process','sub_process','purpose_of_file','key_output_outcome','complexity','key_inputs','key_outputs'];const show=keys=>'<dl>'+keys.map(k=>{const v=a.file[k];return `<dt>${esc(label(k))}</dt><dd>${esc(val(v))}<br><small class="muted">${esc(v.basis)}${v.confidence!==null?' · '+v.confidence:''}</small></dd>`}).join('')+'</dl>';out+='<h3>File assessment</h3>'+show(core)+'<details class="tabline"><summary>All file assessment fields</summary>'+show(Object.keys(a.file).filter(k=>!core.includes(k)))+'</details><h3>Worksheet detail</h3>'+a.tabs.map(t=>`<details class="tabline"><summary>${esc(val(t.tab_name))} · ${esc(val(t.tab_visibility))} · ${esc(val(t.tab_category))}</summary><dl>${Object.entries(t).filter(([k])=>k!=='tab_name').map(([k,v])=>`<dt>${esc(label(k))}</dt><dd>${esc(val(v))}<br><small class="muted">${esc(v.basis)}${v.evidence?.length?' · '+esc(v.evidence.join('; ')):''}</small></dd>`).join('')}</dl></details>`).join('');out+='<h3>Diagnostics</h3><p>'+esc(a.review.hidden_summary.header||'')+'</p>'+(a.review.hidden_summary.groups||[]).map(g=>`<div class="notice"><b>${esc(g.purpose)}</b> · ${g.count} hidden tab(s)<br>${esc(g.sheets.join(', '))}<br><small>Used by: ${esc(g.depended_on_by.join(', ')||'none detected')}</small></div>`).join('')+a.review.error_groups.map(g=>`<div class="notice"><b>${esc(g.error_type)}</b> · ${g.count} cells · ${esc(g.sheet)} · ${esc(g.area_type)}<br>${esc(g.reviewer_action)}</div>`).join('');}
 $('detail').innerHTML=out;document.querySelector('.detail').scrollTop=0;}
-async function compare(){const ids=[...selected].slice(0,20);if(ids.length<2){$('comparison').textContent='Select at least two EUCs.';return}const d=await get('/api/compare?ids='+ids.join(','));$('comparison').innerHTML='<p class="muted">Showing up to 20 selected EUCs; exports include the full selection.</p><div class="comparison">'+d.files.map(r=>`<div class="card"><b>${esc(r.file_name)}</b><p><strong>Business area:</strong> ${esc(r.business_area||'—')}</p><p><strong>Process:</strong> ${esc(r.process||'—')}</p><p><strong>Sub-process:</strong> ${esc(r.sub_process||'—')}</p><p title="${esc(r.output||'')}"><strong>Output:</strong> ${esc(short(r.output))}</p><p><strong>Logic:</strong> ${esc(r.logic||'—')}</p><p><strong>No. of Sheets:</strong> ${r.sheet_count}; <strong>errors:</strong> ${r.cached_error_count}</p></div>`).join('')+'</div><h3>Structural matches</h3>'+(d.pairs.length?d.pairs.map(p=>`<div class="notice"><b>${esc(p.a)} ↔ ${esc(p.b)}</b> · ${esc(p.relationship)} · score ${p.score}</div>`).join(''):'No selected pair met the structural similarity threshold.');}
+async function compare(){const ids=[...selected].slice(0,20);if(ids.length<2){$('comparison').textContent='Select at least two EUCs.';return}const d=await get('/api/compare?ids='+ids.join(','));$('comparison').innerHTML='<p class="muted">Showing up to 20 selected EUCs; exports include the full selection.</p><div class="comparison">'+d.files.map(r=>`<div class="card"><b>${esc(r.file_name)}</b><p><strong>Business Area Purpose:</strong> ${esc(r.business_area||'—')}</p><p><strong>Process:</strong> ${esc(r.process||'—')}</p><p><strong>Sub-process:</strong> ${esc(r.sub_process||'—')}</p><p title="${esc(r.output||'')}"><strong>Output:</strong> ${esc(short(r.output))}</p><p><strong>Logic:</strong> ${esc(r.logic||'—')}</p><p><strong>No. of Sheets:</strong> ${r.sheet_count}; <strong>errors:</strong> ${r.cached_error_count}</p></div>`).join('')+'</div><h3>Structural matches</h3>'+(d.pairs.length?d.pairs.map(p=>`<div class="notice"><b>${esc(p.a)} ↔ ${esc(p.b)}</b> · ${esc(p.relationship)} · score ${p.score}</div>`).join(''):'No selected pair met the structural similarity threshold.');}
 async function download(kind){const r=await fetch('/api/export',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({kind,ids:[...selected]})});if(!r.ok){alert(await r.text());return}const blob=await r.blob(),a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=({'csv':'file_summary.csv','excel':'portfolio_review.xlsx','tabs':'worksheet_details.csv','diagnostics':'diagnostics.csv','findings':'portfolio_findings.csv','bundle':'euc_review_bundle.zip'})[kind];a.click();setTimeout(()=>URL.revokeObjectURL(a.href),30000)}
 $('files').addEventListener('change',e=>{if(e.target.dataset.id){let id=Number(e.target.dataset.id);e.target.checked?selected.add(id):selected.delete(id);syncSelected()}});$('files').addEventListener('click',e=>{const id=e.target.dataset.open;if(id){e.preventDefault();detail(id)}});$('select-page').onchange=e=>{for(const r of pageRows)e.target.checked?selected.add(r.id):selected.delete(r.id);syncSelected();files()};$('refresh').onclick=()=>{offset=0;files()};$('search').onkeydown=e=>{if(e.key==='Enter'){offset=0;files()}};$('status').onchange=()=>{offset=0;files()};$('prev').onclick=()=>{offset-=limit;files()};$('next').onclick=()=>{offset+=limit;files()};$('compare').onclick=compare;for(const kind of ['csv','excel','tabs','diagnostics'])$(kind).onclick=()=>download(kind);$('findings-csv').onclick=()=>download('findings');$('bundle').onclick=()=>download('bundle');overview();files();
 </script></html>"""
@@ -126,7 +126,7 @@ def make_handler(run_dir):
                         for r in db.execute("SELECT * FROM files" + clause + " ORDER BY file_name,id LIMIT ? OFFSET ?", (*args, limit, offset)):
                             s = json.loads(r["summary_json"]) if r["summary_json"] else {}
                             rows.append({"id": r["id"], "file_id": r["file_id"], "file_name": r["file_name"],
-                                         "scan_status": r["scan_status"], "business_area": s.get("Business Area / Process"),
+                                         "scan_status": r["scan_status"], "business_area": s.get("Business Area Purpose"),
                                          "process": s.get("Process"), "sub_process": s.get("Sub-Process"),
                                          "output": s.get("Key Output / Outcome"), "sheet_count": r["sheet_count"],
                                          "hidden_count": r["hidden_count"], "cached_error_count": r["cached_error_count"],
@@ -145,9 +145,10 @@ def make_handler(run_dir):
                                 for field in tab.values():
                                     field["display"] = fmt_value(field["value"])
                         public_file = {key: r[key] for key in (
-                            "id", "file_id", "file_name", "scan_status", "scan_error",
+                            "id", "file_id", "file_name", "scan_status",
                             "sheet_count", "hidden_count", "cached_error_count", "review_count",
                         )}
+                        public_file["scan_error"] = _display_scan_error(r["scan_error"])
                         return self._json({"file": public_file, "assessment": a})
                     if u.path == "/api/compare":
                         ids = [int(x) for x in query.get("ids", [""])[0].split(",") if x.isdigit()][:20]
@@ -155,7 +156,7 @@ def make_handler(run_dir):
                         fps = []
                         for r in selected_files(db, ids):
                             s = json.loads(r["summary_json"]) if r["summary_json"] else {}
-                            rows.append({"file_name": r["file_name"], "business_area": s.get("Business Area / Process"),
+                            rows.append({"file_name": r["file_name"], "business_area": s.get("Business Area Purpose"),
                                          "process": s.get("Process"), "sub_process": s.get("Sub-Process"),
                                          "output": s.get("Key Output / Outcome"), "logic": s.get("Logic Types"),
                                          "sheet_count": r["sheet_count"], "cached_error_count": r["cached_error_count"]})
@@ -167,9 +168,7 @@ def make_handler(run_dir):
                                 score = similarity(a_fp, b_fp)
                                 if score["overall"] >= SIMILAR_THRESHOLD or score["skeleton"] >= SKELETON_DUP:
                                     pairs.append({"a": a_name, "b": b_name, "score": score["overall"],
-                                                  "relationship": ("Potential duplicate" if score["overall"] >= DUP_THRESHOLD
-                                                                   or score["skeleton"] >= SKELETON_DUP else
-                                                                   "Similar / consolidation review")})
+                                                  "relationship": "Structural similarity review"})
                         pairs.sort(key=lambda p: -p["score"])
                         return self._json({"files": rows, "pairs": pairs[:30]})
                     m = re.fullmatch(r"/original/(\d+)", u.path)

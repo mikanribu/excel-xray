@@ -171,7 +171,7 @@ def _report_info_sheet(wb: Workbook, wx) -> None:
     from .util import safe_scan_message
     scan_error = (safe_scan_message("; ".join(wx.warnings[:3]) or
                                     "Workbook scan was partial; review diagnostics.", wx.path)
-                  if wx.parse_status == "partial" else "—")
+                  if wx.parse_status == "partial" else "N/A")
     rows = [
         ["File name", wx.filename],
         ["Scan status", wx.parse_status],

@@ -424,23 +424,131 @@ def _retirement() -> Field:
 
 
 def _reconciliation_logic(wx: WorkbookXray) -> Field:
-    candidates = []
-    questions = []
-    for s in wx.sheets:
-        d = rr.reconciliation_detail(s)
-        if d.get("status") == "not_detected":
+    reconciliations = [
+        detail
+        for sheet in wx.sheets
+        for detail in rr.reconciliation_details(sheet)
+    ]
+    count = len(reconciliations)
+    value = {
+        "reconciliation_count": count,
+        "reconciliations": reconciliations,
+        "status": ("structural candidates — owner confirmation required" if count
+                   else "No genuine reconciliation evidence detected"),
+    }
+    evidence = (["each candidate has two distinct source fields and a comparison cue"]
+                if count else ["no two-source comparison was evidenced; standalone calculations are excluded"])
+    return Field.derived(value, 0.6, evidence)
+
+
+_RECON_COMPARE_MARKERS = (
+    "recon", "variance", "difference", "tie out", "tie-out", "matched",
+    "match status", "agreed", "comparison",
+)
+
+
+def _normalise_reconciliation_result(data: dict, bundle: dict) -> dict | None:
+    """Accept only model findings grounded in two cited sources and a comparison cue."""
+    if not isinstance(data, dict) or not isinstance(data.get("reconciliations"), list):
+        return None
+    tabs = {str(t.get("name", "")).casefold(): t for t in bundle.get("tabs", [])}
+    accepted = []
+    seen = set()
+    for item in data["reconciliations"]:
+        if not isinstance(item, dict):
             continue
-        if "reviewer_question" in d:
-            questions.append(d["reviewer_question"])
-            candidates.append({"tab": s.name, **d})
-    if not candidates:
-        return Field.derived(
-            "No reconciliation pattern detected", 0.6,
-            ["no lookup/variance logic or reconciliation-labelled headers on any tab"],
-        )
-    return Field.derived(
-        {"candidates": candidates, "reviewer_questions": questions}, 0.6,
-        ["structural candidates only; agreement, tolerance and exception handling require owner confirmation"],
+        worksheet = str(item.get("worksheet") or "").strip()
+        tab = tabs.get(worksheet.casefold())
+        if not tab:
+            continue
+        source_a = str(item.get("source_a") or "").strip()
+        source_b = str(item.get("source_b") or "").strip()
+        if not source_a or not source_b or source_a.casefold() == source_b.casefold():
+            continue
+        headers = [str(h).strip() for h in tab.get("headers", []) if h]
+        allowed_text = [worksheet, *headers]
+        # Deterministic structural candidates may contain headers beyond the
+        # compact prompt's ordinary per-tab header sample.
+        candidates = (bundle.get("reconciliation_candidates") or {}).get("reconciliations", [])
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            if candidate.get("worksheet", "").casefold() == worksheet.casefold():
+                allowed_text.extend([candidate.get("source_a", ""),
+                                     candidate.get("source_b", ""),
+                                     *candidate.get("evidence", [])])
+        allowed = {text.strip().casefold() for text in allowed_text if text}
+        evidence = []
+        for cite in item.get("evidence") or []:
+            if not isinstance(cite, dict):
+                continue
+            cite_tab = str(cite.get("worksheet") or "").strip().casefold()
+            cite_text = str(cite.get("text") or "").strip()
+            if cite_tab == worksheet.casefold() and cite_text.casefold() in allowed:
+                evidence.append(cite_text)
+        cited = {e.casefold() for e in evidence}
+        if source_a.casefold() not in allowed or source_b.casefold() not in allowed:
+            continue
+        if source_a.casefold() not in cited or source_b.casefold() not in cited:
+            continue
+        comparison_evidence = [e for e in evidence
+                               if any(marker in e.casefold() for marker in _RECON_COMPARE_MARKERS)]
+        if not comparison_evidence and not any(
+            marker in worksheet.casefold() for marker in _RECON_COMPARE_MARKERS
+        ):
+            continue
+        key = (worksheet.casefold(), source_a.casefold(), source_b.casefold())
+        if key in seen:
+            continue
+        seen.add(key)
+        accepted.append({
+            "status": "identified from workbook evidence — owner confirmation required",
+            "worksheet": worksheet,
+            "overview": f"Compare {source_a} against {source_b}",
+            "source_a": source_a,
+            "source_b": source_b,
+            "matching_criteria": (str(item.get("matching_criteria"))
+                                  if str(item.get("matching_criteria") or "").casefold() in allowed
+                                  else "Not established from workbook evidence"),
+            "tolerance": (str(item.get("tolerance"))
+                          if str(item.get("tolerance") or "").casefold() in allowed
+                          else "Not identified from workbook evidence"),
+            "exception_logic": (str(item.get("exception_logic"))
+                                if str(item.get("exception_logic") or "").casefold() in allowed
+                                else "Not documented in workbook evidence"),
+            "evidence": evidence,
+        })
+    count = len(accepted)
+    return {
+        "reconciliation_count": count,
+        "reconciliations": accepted,
+        "status": ("identified — owner confirmation required" if count
+                   else "No genuine reconciliation evidenced"),
+    }
+
+
+def _apply_reconciliation_result(a: Assessment, assessor, bundle: dict) -> None:
+    method = getattr(assessor, "reconcile", None)
+    if not callable(method):
+        return
+    try:
+        data = method(bundle)
+    except Exception:
+        a.file.reconciliation_logic.evidence.append(
+            "LLM reconciliation review was unavailable; structural result retained")
+        return
+    value = _normalise_reconciliation_result(data, bundle)
+    if value is None:
+        a.file.reconciliation_logic.evidence.append(
+            "LLM reconciliation response did not meet the required structured evidence checks")
+        return
+    cited = [f"{item['worksheet']}: {', '.join(item['evidence'])}"
+             for item in value["reconciliations"]]
+    a.file.reconciliation_logic = Field(
+        value=value, basis=getattr(assessor, "basis", "inferred"),
+        confidence=0.7,
+        evidence=["reconciliations require two distinct cited sources and a comparison cue",
+                  *cited] if cited else ["model found no evidenced two-source comparison"],
     )
 
 
@@ -903,7 +1011,8 @@ def _apply_narrative(a: Assessment, narr, basis: str, label: str) -> None:
         (a.file.process, getattr(narr, "process", None), getattr(narr, "process_evidence", [])),
         (a.file.sub_process, getattr(narr, "sub_process", None), getattr(narr, "sub_process_evidence", [])),
     ):
-        supported = bool(value and supported_evidence(evidence))
+        supported = bool(getattr(narr, "business_use_case", None)
+                         and value and supported_evidence(evidence))
         if supported:
             put(fld, value)
             fld.evidence = ev + [f"source evidence: {item}" for item in evidence]
@@ -987,6 +1096,7 @@ def assess(wx: WorkbookXray, assessor=None) -> Assessment:
     narr = assessor.narrate(evidence_bundle)
     narr._evidence_bundle = evidence_bundle
     _apply_narrative(a, narr, assessor.basis, assessor.label)
+    _apply_reconciliation_result(a, assessor, evidence_bundle)
     for candidate in a.review.simplification_candidates + a.review.automation_candidates:
         candidate["process"] = fa.process.value
         candidate["sub_process"] = fa.sub_process.value

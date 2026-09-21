@@ -276,7 +276,11 @@ def shorten_external(path: str) -> str:
     parsed = urllib.parse.urlsplit(raw)
     candidate = parsed.path if parsed.scheme else raw.split("?", 1)[0].split("#", 1)[0]
     candidate = candidate.replace("\\", "/")
-    return posixpath.basename(candidate.rstrip("/")) or "unresolved external workbook"
+    name = posixpath.basename(candidate.rstrip("/")) or "unresolved external workbook"
+    # Literal percent signs are noisy in display names and may look like an
+    # encoded path fragment to reviewers. URL escapes have already been decoded.
+    name = re.sub(r"\s+", " ", name.replace("%", " ")).strip()
+    return name or "unresolved external workbook"
 
 
 def _connection_label(connection: dict) -> str:
@@ -384,7 +388,21 @@ def group_key_inputs(wx, tab_index: dict[str, TabFacts],
                 "essentiality": "Not established — confirm with process owner",
             })
 
+    other_tabs = sorted(
+        set(input_sheets) | set(lookup_tables)
+        | {name for name, consumers in (read_by or {}).items() if consumers}
+    )
+    other_eucs = [
+        {"file_name": f["file_name"], "reference_count": f["reference_count"],
+         "business_purpose": purpose}
+        for purpose, group in external_groups.items()
+        for f in group["files"]
+    ]
     return {
+        # Explicit business-facing group names, while retaining the original
+        # keys for clients that consume the earlier structured schema.
+        "other_tabs_within_this_euc": other_tabs,
+        "other_eucs": other_eucs,
         "in_workbook_sheets": input_sheets or ["none identified as a dedicated input tab"],
         "lookup_mapping_tables": lookup_tables or ["none identified"],
         "data_connections": data_connections or ["none"],
@@ -455,45 +473,66 @@ def business_calculation_description(s, tf: TabFacts | None) -> str | None:
 
 # ------------------------------------------------------------- reconciliation
 
-_RECON_SRC_HINTS = ("source", "from", "gl", "tb", "ledger")
-_RECON_TGT_HINTS = ("target", "to", "report", "control", "reserve")
+_RECON_SRC_HINTS = ("source", "from", "gl", "tb", "ledger", "dataset a", "system a")
+_RECON_TGT_HINTS = ("target", "to", "report", "control", "reserve", "subledger",
+                    "dataset b", "system b", "comparison")
 _RECON_KEY_HINTS = ("id", "code", "ref", "key", "account", "policy")
+_RECON_COMPARISON_HINTS = ("recon", "variance", "difference", "tie out", "tie-out",
+                           "matched", "match status", "agreed", "comparison")
+
+
+def reconciliation_details(s) -> list[dict]:
+    """Return structural candidates only when two sources and a comparison cue exist.
+
+    A SUM, lookup, or reconciliation-labelled worksheet alone is not a
+    reconciliation. Each independent region can contribute one candidate.
+    The LLM stage may then validate and describe candidates using the workbook's
+    value-free evidence bundle.
+    """
+    out = []
+    for index, region in enumerate(s.regions, 1):
+        headers = [str(h).strip() for h in region.headers if h]
+        header_text = " ".join(headers).casefold()
+        candidates_a = [h for h in headers if any(k in h.casefold() for k in _RECON_SRC_HINTS)]
+        candidates_b = [h for h in headers if any(k in h.casefold() for k in _RECON_TGT_HINTS)]
+        source = candidates_a[0] if candidates_a else None
+        target = next((h for h in candidates_b if h != source), None)
+        # Explicitly paired columns such as Dataset A / Dataset B are also valid.
+        if not source or not target:
+            paired = [h for h in headers if re.search(r"(?i)\b(?:source|dataset|system)\s*[ab12]\b", h)]
+            if len(paired) >= 2:
+                source, target = paired[:2]
+        comparison_markers = [h for h in headers
+                              if any(k in h.casefold() for k in _RECON_COMPARISON_HINTS)]
+        named_comparison = any(k in s.name.casefold() for k in _RECON_COMPARISON_HINTS)
+        if not source or not target or source.casefold() == target.casefold():
+            continue
+        if not (comparison_markers or named_comparison):
+            continue
+        key = next((h for h in headers if any(k in h.casefold() for k in _RECON_KEY_HINTS)), None)
+        evidence = [source, target, *comparison_markers]
+        out.append({
+            "status": "candidate — owner confirmation required",
+            "worksheet": s.name,
+            "region": index,
+            "overview": f"Compare {source} against {target}",
+            "source_a": source,
+            "source_b": target,
+            "matching_criteria": key or "Not established from workbook structure",
+            "tolerance": "Not identified from workbook structure",
+            "exception_logic": "Not documented in workbook structure",
+            "evidence": evidence,
+            "reviewer_question": (f"Confirm how '{source}' is compared with '{target}', "
+                                  f"the matching key, tolerance and exception handling "
+                                  f"for '{s.name}'."),
+        })
+    return out
 
 
 def reconciliation_detail(s) -> dict:
-    """Return a review candidate, never a confirmed tie-out from headers alone.
-
-    The structural scan does not inspect calculated values or prove that two
-    sources agree, so confirmation always remains with the process owner.
-    """
-    fns = dict(s.formula_profile.get("top_functions", []))
-    has_abs = bool(fns.get("ABS"))
-    headers = [h for r in s.regions for h in r.headers if h]
-    header_text = " ".join(headers).lower()
-    labeled_recon = any(word in header_text or word in s.name.lower()
-                        for word in ("recon", "variance", "difference", "tie out", "tie-out", "matched"))
-    source = next((h for h in headers if any(k in h.lower() for k in _RECON_SRC_HINTS)), None)
-    target = next((h for h in headers if any(k in h.lower() for k in _RECON_TGT_HINTS)), None)
-    key = next((h for h in headers if any(k in h.lower() for k in _RECON_KEY_HINTS)), None)
-    if not (labeled_recon or (has_abs and source and target)):
-        return {"status": "not_detected"}
-    evidence = []
-    if has_abs:
-        evidence.append("absolute-difference formula observed")
-    if labeled_recon:
-        evidence.append("reconciliation/variance label observed")
-    return {
-        "status": "candidate — owner confirmation required",
-        "source": source or "not established",
-        "comparison_target": target or "not established",
-        "matching_key": key or "not established",
-        "agreement_evidence": "not established from workbook structure",
-        "variance_rule": "not established from workbook structure",
-        "exception_output": "not established from workbook structure",
-        "observed_evidence": evidence,
-        "reviewer_question": (f"Confirm the two sources, matching key, agreement or tolerance rule, "
-                              f"and where exceptions are reviewed for '{s.name}'."),
-    }
+    """Compatibility wrapper returning the first candidate, if any."""
+    candidates = reconciliation_details(s)
+    return candidates[0] if candidates else {"status": "not_detected"}
 
 
 # ------------------------------------------------------------ manual entry

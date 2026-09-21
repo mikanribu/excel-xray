@@ -20,7 +20,10 @@ from dataclasses import asdict
 from pathlib import Path
 
 from .assessment import assess, to_dict
-from .corpus import DUP_THRESHOLD, SIMILAR_THRESHOLD, SKELETON_DUP, Fingerprint, fingerprint, similarity
+from .corpus import (DUP_THRESHOLD, SIMILAR_THRESHOLD, SKELETON_DUP, Fingerprint,
+                     _run_rationalization, fingerprint, rationalization_context,
+                     similarity)
+from .review_rules import shorten_external
 from .scan import xray_workbook
 from .tabular import FILE_FIELDS, TAB_FIELDS, fmt_value
 from .util import safe_scan_message
@@ -106,6 +109,12 @@ def _safe_scan_error(exc: Exception, path: str) -> str:
     return f"{getattr(exc, 'category', type(exc).__name__)}: {message}".strip()
 
 
+def _display_scan_error(value) -> str:
+    """Use a stable reviewer-facing value for successful scans without errors."""
+    text = str(value).strip() if value is not None else ""
+    return text or "N/A"
+
+
 def _store_failure(db: sqlite3.Connection, path: str, exc: Exception) -> None:
     try:
         st = os.stat(path)
@@ -183,7 +192,7 @@ def _restore_fp(raw: str) -> Fingerprint:
     return Fingerprint(**d)
 
 
-def _compare(db: sqlite3.Connection) -> None:
+def _compare(db: sqlite3.Connection, assessor=None) -> None:
     """Compare compact fingerprints, without retaining workbook scans.
 
     Every pair is considered at 2,000 files (about two million lightweight
@@ -195,8 +204,8 @@ def _compare(db: sqlite3.Connection) -> None:
     db.execute("DELETE FROM pairs")
     top: dict[int, list] = {pk: [] for pk, _ in fps}
 
-    def offer(pk, peer, score, relationship):
-        item = (score["overall"], peer, relationship, _json(score))
+    def offer(pk, peer, score):
+        item = (score["overall"], peer, "Structural similarity review", _json(score))
         heap = top[pk]
         if len(heap) < MAX_MATCHES_PER_FILE:
             heapq.heappush(heap, item)
@@ -208,10 +217,8 @@ def _compare(db: sqlite3.Connection) -> None:
             score = similarity(a, b)
             if score["overall"] < SIMILAR_THRESHOLD and score["skeleton"] < SKELETON_DUP:
                 continue
-            relationship = ("Potential duplicate" if score["overall"] >= DUP_THRESHOLD
-                            or score["skeleton"] >= SKELETON_DUP else "Similar / consolidation review")
-            offer(a_id, b_id, score, relationship)
-            offer(b_id, a_id, score, relationship)
+            offer(a_id, b_id, score)
+            offer(b_id, a_id, score)
     review_pairs = {}
     for pk, heap in top.items():
         for score, peer, relationship, signals in heap:
@@ -219,8 +226,8 @@ def _compare(db: sqlite3.Connection) -> None:
             review_pairs[(a_id, b_id)] = (score, relationship, signals)
     db.executemany("INSERT INTO pairs VALUES(?,?,?,?,?)",
                    ((a, b, *details) for (a, b), details in review_pairs.items()))
-    # Update the three corpus fields in both the flat summary and individual
-    # assessment JSON so on-demand reports reflect the whole run.
+    # Persist structural candidates as review shortlists only. A similarity
+    # score is never written as a business duplication/consolidation finding.
     count = len(fps)
     matches = defaultdict(list)
     for p in db.execute("""SELECT p.*,a.file_name AS a_name,b.file_name AS b_name,
@@ -229,32 +236,71 @@ def _compare(db: sqlite3.Connection) -> None:
         signals = json.loads(p["signals_json"])
         for pk, peer, peer_id in ((p["file_a"], p["b_name"], p["b_file_id"]),
                                   (p["file_b"], p["a_name"], p["a_file_id"])):
-            matches[pk].append({"file": peer, "file_id": peer_id,
+            matches[pk].append({"file": shorten_external(peer), "file_id": peer_id,
+                                "comparison_id": str(p["file_b"] if pk == p["file_a"] else p["file_a"]),
                                 "similarity": p["score"], "signals": signals})
-    for row in db.execute("SELECT id,summary_json,assessment_json FROM files WHERE assessment_json IS NOT NULL").fetchall():
-        ms = sorted(matches[row["id"]], key=lambda m: -m["similarity"])
-        duplicates = [m for m in ms if m["similarity"] >= DUP_THRESHOLD
-                      or m["signals"]["skeleton"] >= SKELETON_DUP]
+
+    stored = db.execute("SELECT id,summary_json,assessment_json,fingerprint_json FROM files "
+                        "WHERE assessment_json IS NOT NULL").fetchall()
+    rows_by_id = {r["id"]: r for r in stored}
+    for row in stored:
+        pk = row["id"]
+        ms = sorted(matches[pk], key=lambda m: -m["similarity"])
+        note = (f"{count - 1} other workbook(s) compared; structural matches are review "
+                f"shortlists only; strongest {MAX_MATCHES_PER_FILE} retained per EUC")
         a = json.loads(row["assessment_json"])
-        summary = json.loads(row["summary_json"])
-        updates = {
-            "potential_duplication": {"verdict": "Yes" if duplicates else "No",
-                                      "matches": duplicates[:20], "corpus_compared": count - 1,
-                                      "similarity_threshold": DUP_THRESHOLD},
-            "similar_duplicate_files": [m["file"] for m in ms[:20]],
-            "potential_consolidation": {"verdict": "Yes" if duplicates else
-                                        "Possibly" if ms else "No",
-                                        "candidates": [m["file"] for m in ms[:20]]},
-        }
-        for key, value in updates.items():
-            a["file"][key] = {"value": value, "basis": "derived", "confidence": 0.65,
-                               "evidence": [f"{count - 1} other workbook(s) compared across this run; "
-                                            f"strongest {MAX_MATCHES_PER_FILE} match(es) retained per EUC"]}
+        a.setdefault("file", {})
+        a["file"].update({
+            "potential_duplication": {
+                "value": {"verdict": "Not established — functional comparison required",
+                          "matches": ms, "corpus_compared": count - 1,
+                          "similarity_threshold": DUP_THRESHOLD},
+                "basis": "needs_corpus", "confidence": None,
+                "evidence": [note, "shared process labels or structural similarity alone do not establish duplicate activity"],
+            },
+            "similar_duplicate_files": {
+                "value": "Not established — functional comparison required",
+                "basis": "needs_corpus", "confidence": None, "evidence": [note],
+            },
+            "potential_consolidation": {
+                "value": {"verdict": "Not established — functional comparison required",
+                          "candidates": [], "structural_candidates": ms},
+                "basis": "needs_corpus", "confidence": None,
+                "evidence": [note, "consolidation requires business-purpose fit and blocker review"],
+            },
+        })
+
+        if callable(getattr(assessor, "rationalize", None)) and row["fingerprint_json"]:
+            try:
+                assessment = assessment_from_json(_json(a))
+                fp = _restore_fp(row["fingerprint_json"])
+                current = rationalization_context(a, fp, comparison_id=str(pk))
+                current["corpus_compared"] = count - 1
+                peers = []
+                for match in ms:
+                    peer_row = rows_by_id.get(int(match["comparison_id"]))
+                    if not peer_row or not peer_row["fingerprint_json"]:
+                        continue
+                    peer_assessment = json.loads(peer_row["assessment_json"])
+                    peer_fp = _restore_fp(peer_row["fingerprint_json"])
+                    peer = rationalization_context(
+                        peer_assessment, peer_fp, comparison_id=str(peer_row["id"]))
+                    peer["structural_similarity"] = match["signals"]
+                    peers.append(peer)
+                _run_rationalization(assessment, current, peers, assessor)
+                from .assessment import to_dict
+                a = to_dict(assessment)
+            except (KeyError, TypeError, ValueError):
+                # Older/partial assessment JSON can still retain structural
+                # review candidates even when it cannot enter the LLM stage.
+                pass
+
+        summary = json.loads(row["summary_json"]) if row["summary_json"] else {}
         for _, attr, label in FILE_FIELDS:
-            if attr in updates:
-                summary[label] = fmt_value(updates[attr])
+            field_value = (a.get("file", {}).get(attr) or {}).get("value")
+            summary[label] = fmt_value(field_value)
         db.execute("UPDATE files SET assessment_json=?,summary_json=? WHERE id=?",
-                   (_json(a), _json(summary), row["id"]))
+                   (_json(a), _json(summary), pk))
 
 
 def _findings(db: sqlite3.Connection) -> None:
@@ -288,38 +334,121 @@ def _findings(db: sqlite3.Connection) -> None:
     for r in db.execute("SELECT relationship,COUNT(*) AS pairs FROM pairs GROUP BY relationship"):
         files = db.execute("SELECT COUNT(DISTINCT id) FROM files WHERE id IN (SELECT file_a FROM pairs WHERE relationship=? UNION SELECT file_b FROM pairs WHERE relationship=?)",
                            (r["relationship"], r["relationship"])).fetchone()[0]
-        add("Cross-EUC comparison", "High" if r["relationship"] == "Potential duplicate" else "Review",
+        add("Cross-EUC comparison", "Review",
             files, r["pairs"], r["relationship"],
-            "Review the linked EUCs together; confirm business purpose and outputs before any consolidation.",
-            f"{r['pairs']} retained review pair(s); up to {MAX_MATCHES_PER_FILE} strongest matches per EUC. "
-            "Similarity is structural evidence, not proof of duplicate business activity.")
+            "Compare business purpose, inputs, calculations, controls and outputs before deciding whether the EUCs are similar or could be consolidated.",
+            f"{r['pairs']} structural review pair(s); up to {MAX_MATCHES_PER_FILE} strongest matches per EUC. "
+            "Similarity scores do not establish functional duplication.")
     r = db.execute("SELECT COUNT(*) AS files,SUM(review_count) AS tabs FROM files WHERE review_count>0").fetchone()
     if r["files"]:
         add("Human validation", "Review", r["files"], r["tabs"],
             "Tabs needing human validation", "Use the worksheet details and each tab's validation reason to assign review.",
             f"{r['tabs']} tab(s) across {r['files']} EUC(s).")
-    opportunities = {"potential_simplification": [0, 0], "potential_automation": [0, 0]}
-    for row in db.execute("SELECT assessment_json FROM files WHERE assessment_json IS NOT NULL"):
-        file_fields = json.loads(row["assessment_json"])["file"]
-        for key in opportunities:
-            value = file_fields.get(key, {}).get("value") or {}
-            candidates = value.get("candidates", []) if isinstance(value, dict) else []
-            if key == "potential_automation":
-                candidates = [c for c in candidates if str(c.get("suspected_manual_step", ""))
-                              .lower().startswith("explicit manual-entry/override area")]
-            if candidates:
-                opportunities[key][0] += 1
-                opportunities[key][1] += len(candidates)
-    for key, title, action in (
-        ("potential_simplification", "Simplification candidates",
-         "Review the suggested changes with process owners and confirm the business benefit."),
-        ("potential_automation", "Manual-workflow review leads",
-         "Confirm the manual step, frequency, inputs, exceptions and approval controls before assessing automation suitability."),
-    ):
-        files, tabs = opportunities[key]
-        if files:
-            add("Cross-EUC opportunities", "Review", files, tabs, title, action,
-                f"{tabs} candidate tab(s) across {files} workbook(s); each remains a review hypothesis.")
+    rationalization = {
+        key: {"files": set(), "items": set(), "examples": []}
+        for key in ("duplication", "similarity", "simplification", "consolidation",
+                    "automation", "retirement")
+    }
+    file_names = {r["id"]: r["file_name"] for r in
+                  db.execute("SELECT id,file_name FROM files")}
+
+    def value_of(file_fields, name):
+        fld = file_fields.get(name) or {}
+        return fld.get("value") if isinstance(fld, dict) else None
+
+    def record_pair(kind, current_id, candidate):
+        try:
+            peer_id = int(candidate.get("comparison_id"))
+        except (TypeError, ValueError):
+            return
+        if peer_id not in file_names or current_id == peer_id:
+            return
+        pair = tuple(sorted((current_id, peer_id)))
+        group = rationalization[kind]
+        group["items"].add(pair)
+        group["files"].update(pair)
+        if len(group["examples"]) < 5:
+            example = f"{shorten_external(file_names[current_id])} ↔ {shorten_external(file_names[peer_id])}"
+            if example not in group["examples"]:
+                group["examples"].append(example)
+
+    def record_local(kind, file_id, candidates):
+        group = rationalization[kind]
+        for index, candidate in enumerate(candidates):
+            if not isinstance(candidate, dict):
+                continue
+            group["files"].add(file_id)
+            group["items"].add((file_id, index))
+            if len(group["examples"]) < 5:
+                label = candidate.get("worksheet") or candidate.get("observed_manual_step") or "workbook"
+                group["examples"].append(f"{shorten_external(file_names[file_id])}: {label}")
+
+    manual_cues = ("manual", "paste", "override", "keyed", "hardcode", "hard-coded")
+    for row in db.execute("SELECT id,file_name,assessment_json FROM files WHERE assessment_json IS NOT NULL"):
+        current_id = row["id"]
+        file_fields = json.loads(row["assessment_json"]).get("file", {})
+        duplication = value_of(file_fields, "potential_duplication") or {}
+        if (isinstance(duplication, dict)
+                and str(duplication.get("verdict", "")).startswith("Potential functional duplication")):
+            for candidate in duplication.get("matches", []):
+                if isinstance(candidate, dict):
+                    record_pair("duplication", current_id, candidate)
+        similar = value_of(file_fields, "similar_duplicate_files") or []
+        for candidate in similar if isinstance(similar, list) else []:
+            if isinstance(candidate, dict):
+                record_pair("similarity", current_id, candidate)
+        consolidation = value_of(file_fields, "potential_consolidation") or {}
+        if (isinstance(consolidation, dict)
+                and str(consolidation.get("verdict", "")).startswith("Potential consolidation")):
+            for candidate in consolidation.get("candidates", []):
+                if isinstance(candidate, dict):
+                    record_pair("consolidation", current_id, candidate)
+
+        simplification = value_of(file_fields, "potential_simplification") or {}
+        local_simplification = (simplification.get("candidates", [])
+                                if isinstance(simplification, dict) else [])
+        record_local("simplification", current_id, local_simplification)
+
+        automation = value_of(file_fields, "potential_automation") or {}
+        local_automation = (automation.get("candidates", [])
+                            if isinstance(automation, dict) else [])
+        local_automation = [candidate for candidate in local_automation
+                            if isinstance(candidate, dict) and any(
+                                any(cue in str(text).casefold() for cue in manual_cues)
+                                for text in ([candidate.get("suspected_manual_step"),
+                                              candidate.get("observed_manual_step")]
+                                             + [e.get("text", "") if isinstance(e, dict) else e
+                                                for e in candidate.get("evidence", [])])
+                            )]
+        record_local("automation", current_id, local_automation)
+
+        retirement = value_of(file_fields, "potential_retirement") or {}
+        if (isinstance(retirement, dict)
+                and str(retirement.get("verdict", "")).startswith("Potential retirement")):
+            record_local("retirement", current_id, [retirement])
+
+    rollup_specs = (
+        ("duplication", "Potential functional duplication",
+         "Review the cited business similarities and differences with process owners."),
+        ("similarity", "Similar EUC business use cases",
+         "Compare the listed purposes, outputs and material differences."),
+        ("simplification", "Potential simplification",
+         "Review the evidence-backed changes with process owners and confirm the business benefit."),
+        ("consolidation", "Potential consolidation",
+         "Review the shared-solution proposal and documented blockers with process owners."),
+        ("automation", "Potential automation",
+         "Confirm the evidenced manual step, repeatability, inputs, exceptions and controls."),
+        ("retirement", "Potential retirement",
+         "Confirm usage, ownership, recipient needs, replacement coverage and retention obligations."),
+    )
+    for key, title, action in rollup_specs:
+        group = rationalization[key]
+        if group["items"]:
+            examples = "; examples: " + "; ".join(group["examples"]) if group["examples"] else ""
+            add("Cross-EUC rationalisation", "Review", len(group["files"]), len(group["items"]),
+                title, action,
+                f"{len(group['items'])} evidence-backed candidate(s) across {len(group['files'])} EUC(s)."
+                + examples)
     failed = db.execute("SELECT COUNT(*) FROM files WHERE scan_status='failed'").fetchone()[0]
     if failed:
         add("Coverage", "High", failed, 0, "Unreadable workbooks",
@@ -361,7 +490,7 @@ def scan_portfolio(paths: list[str], run_dir: str | Path, *, max_rows: int = 200
                 failed += 1
                 print(f"[{n}/{len(paths)}] FAILED: {os.path.basename(path)}: {exc}", file=sys.stderr)
         with db:
-            _compare(db)
+            _compare(db, assessor)
             _findings(db)
         export_all(db, run_dir)
         return {"scanned": done, "failed": failed, "reused": skipped,
@@ -392,7 +521,7 @@ def summary_rows(db, ids=None):
     for r in selected_files(db, ids):
         summary = json.loads(r["summary_json"]) if r["summary_json"] else {}
         values = [r["id"], r["file_id"], r["file_name"], r["scan_status"],
-                  r["scan_error"], r["sheet_count"], r["hidden_count"],
+                  _display_scan_error(r["scan_error"]), r["sheet_count"], r["hidden_count"],
                   r["cached_error_count"], r["review_count"]]
         yield [_safe(v) for v in values + [summary.get(c, "") for c in SUMMARY_COLUMNS[9:]]]
 
@@ -463,7 +592,7 @@ def finding_rows(db, ids=None):
             group[0].update((r["file_a"], r["file_b"]))
             group[1] += 1
     for relationship, (files, count) in relationships.items():
-        yield ["Selected EUCs", "Cross-EUC comparison", "High" if relationship == "Potential duplicate" else "Review",
+        yield ["Selected EUCs", "Cross-EUC comparison", "Review",
                len(files), count, relationship,
                "Confirm business purpose and outputs before any consolidation.",
                f"{count} pair(s) within the selected EUCs."]

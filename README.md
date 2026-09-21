@@ -121,12 +121,13 @@ so check that the recipient is cleared to review it before enabling delivery.
 | `portfolio.sqlite` | Indexed dashboard data; keep this file and the source workbooks available to use the dashboard later |
 
 The consolidated file summary includes scan status, concise scan errors,
-total/hidden worksheet counts, Business Area / Process, Process and
+total/hidden worksheet counts, Business Area Purpose, Process and
 Sub-Process, plus the file-level review fields. A process label is left as
 “Not established” when the workbook does not contain direct supporting
 evidence. Input sources are grouped by purpose and type, with workbook names,
 reference counts, known worksheet consumers and an explicit owner check for
-source essentiality.
+source essentiality. Key Inputs labels dependencies in two separate groups:
+other tabs within the same EUC and other EUC workbooks.
 
 Reviewer-facing CSV and Excel exports do not include local source paths, file
 sizes or raw SHA-256 values. Technical formula patterns remain in the
@@ -265,7 +266,7 @@ most consequential constant in the detector.
 
 Produced at two levels, matching the review template:
 
-**File level summary** — File ID/Name, Business Area / Process, Process,
+**File level summary** — File ID/Name, Business Area Purpose, Process,
 Sub-Process, Purpose, Key Output / Outcome, Complexity, Key Inputs, Source System, Key Outputs, Usage Frequency,
 Completion Timeline, EUC Preparer, Output Recipient; the AI findings (Potential
 Duplication, Similar/Duplicate Files, Simplification, Consolidation, Automation,
@@ -291,7 +292,13 @@ Purpose, Key Output/Outcome, Process, Sub-Process and each tab's Purpose are wri
 `Assessor`. The default is offline (network-free, `drafted`); unknown business
 labels stay “Not established” for owner confirmation. Pass `--llm` to use a
 model instead (`inferred`); process labels must be supported by exact workbook
-text. This needs the optional `anthropic` and/or `openai`
+text. This checkout has no configured business Process/Sub-Process taxonomy;
+the model keeps the two fields separate and does not treat Logic Types or tab
+categories as that taxonomy. Configure an approved catalogue before claiming
+that Stage 2 has mapped to controlled categories. Reconciliation is separately
+checked against a two-source comparison rule. Portfolio structural similarity
+only creates a shortlist; duplication and rationalisation findings require
+business evidence from the LLM review. This needs the optional `anthropic` and/or `openai`
 package and a credential:
 
 ```bash
