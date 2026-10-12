@@ -39,6 +39,10 @@ class Field:
     basis: Basis = "needs_human"
     confidence: float | None = None
     evidence: list[str] = field(default_factory=list)
+    # Exact source locations supporting a finding, where available.
+    evidence_refs: list[str] = field(default_factory=list)
+    # Heuristic scores are ranking indicators, not calibrated probabilities.
+    confidence_kind: str | None = None
 
     @classmethod
     def extracted(cls, value, evidence=None) -> "Field":
@@ -48,7 +52,7 @@ class Field:
     @classmethod
     def derived(cls, value, confidence, evidence) -> "Field":
         return cls(value=value, basis="derived", confidence=round(confidence, 2),
-                   evidence=list(evidence))
+                   evidence=list(evidence), confidence_kind="heuristic")
 
     @classmethod
     def pending(cls, basis: Basis, note: str = "") -> "Field":
@@ -552,6 +556,7 @@ def _tab_category(s, wx, has_downstream: bool) -> Field:
     kinds = [r.kind for r in s.regions]
     scores: Counter = Counter()
     ev: list[str] = []
+    refs = [f"{s.name}!{r.ref}" for r in s.regions if r.kind != "unknown"][:12]
 
     def hint(*words) -> bool:
         return any(w in name for w in words)
@@ -598,15 +603,19 @@ def _tab_category(s, wx, has_downstream: bool) -> Field:
 
     if not scores:
         return Field(value="Uncertain", basis="needs_llm", confidence=0.3,
-                     evidence=ev + ["no strong category signal — defer to model"])
+                     evidence=ev + ["no strong category signal — defer to model"],
+                     evidence_refs=refs, confidence_kind="heuristic")
     top, sc = scores.most_common(1)[0]
     conf = 0.4 + 0.5 * (sc / sum(scores.values()))
     ranked = ", ".join(f"{k}={v:.1f}" for k, v in scores.most_common())
     ev.append(f"scores: {ranked}")
     if conf < _CATEGORY_MIN_CONF:
         return Field(value="Uncertain", basis="needs_llm", confidence=round(conf, 2),
-                     evidence=ev + [f"top category below {_CATEGORY_MIN_CONF} confidence"])
-    return Field.derived(top, conf, ev)
+                     evidence=ev + [f"top category below {_CATEGORY_MIN_CONF} confidence"],
+                     evidence_refs=refs, confidence_kind="heuristic")
+    result = Field.derived(top, conf, ev)
+    result.evidence_refs = refs
+    return result
 
 
 def _tab_information(s, has_upstream: bool, has_downstream: bool) -> Field:
