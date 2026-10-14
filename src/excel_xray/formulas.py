@@ -36,9 +36,8 @@ _FUNC = re.compile(r"\b([A-Z][A-Z0-9_.]*)\s*\(")
 # sheet prefix (optional) + A1 reference. Handles 'quoted sheet'!, [1]External!,
 # and bare Sheet1!. Column letters capped at 3 (XFD is the Excel maximum).
 _REF = re.compile(
-    r"(?<![A-Za-z0-9_.])(?P<ext>\[\d+\])?"
-    r"(?P<sheet>'(?:[^']|'')+'|[A-Za-z_][A-Za-z0-9_.]*)?"
-    r"(?P<bang>!)?"
+    r"(?<![A-Za-z0-9_.])"
+    r"(?:(?P<ext>\[\d+\])?(?P<sheet>'(?:[^']|'')+'|[A-Za-z_][A-Za-z0-9_.]*)(?P<bang>!))?"
     r"(?P<cabs>\$)?(?P<col>[A-Za-z]{1,3})(?P<rabs>\$)?(?P<row>\d{1,7})"
     r"(?![A-Za-z0-9_(])"
 )
