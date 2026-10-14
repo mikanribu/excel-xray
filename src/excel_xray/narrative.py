@@ -26,6 +26,89 @@ from dataclasses import dataclass, field
 from typing import Protocol
 
 
+PROCESS_SUBPROCESS_PROMPT = """Analyse the EUC and assign an appropriate Process and Sub-process based on the business use case supported by the file.
+
+**Process**
+Identify the end-to-end business process that the EUC supports.
+The Process should represent a stable business capability or outcome rather than a specific report, workbook, system, team or individual activity.
+
+**Sub-process**
+Identify the specific functional use case performed by the EUC within the broader Process.
+The Sub-process should be sufficiently specific to group EUCs that perform materially similar activities, but not so granular that each workbook receives a unique classification.
+When determining the Sub-process, consider:
+• Primary business objective of the EUC
+• Inputs and source data used
+• Key calculations, transformations or mappings performed
+• Reconciliations or controls performed
+• Output produced
+• How the output is used by business users
+• Whether other EUCs perform a similar sequence of activities
+• Whether the EUCs could potentially share a common future automation solution
+
+Follow a two-stage classification for identification:
+Stage 1: Identifies the underlying business use case based on purpose, inputs, calculations, controls and outputs.
+
+Stage 2: Maps that use case against the predefined Process / Sub-process taxonomy. If nothing considered applicable, only proposing a new category where no reasonable existing classification exists."""
+
+
+RATIONALIZATION_PROMPT = """Using the assigned Process and Sub-process, compare EUCs with similar business use cases to identify potential duplication and rationalisation opportunities.
+
+Assess each EUC against the following:
+
+1. Potential Duplication
+
+Identify EUCs that perform materially similar functions based on:
+
+•          Business purpose and output
+
+•          Input data and source systems
+
+•          Calculation, mapping and transformation logic
+
+•          Reconciliations and controls
+
+•          Downstream usage
+
+Do not classify EUCs as duplicates solely because they share the same Process or Sub-process. Explain the specific functional similarities and material differences.
+
+2. Rationalisation Opportunity
+
+Assess the potential for:
+
+•          Simplification: Retain the EUC but remove unnecessary steps, calculations, manual interventions or controls.
+
+•          Consolidation: Combine multiple similar EUCs into a common process, workbook, dataset or solution.
+
+•          Automation: Replace repeatable manual activities with automated data sourcing, calculations, controls, reconciliation or reporting.
+
+•          Retirement: Remove the EUC where its purpose is duplicated, no longer required, or its output can be fully provided by another process or solution.
+
+Assessment principles
+
+•          Consider the end-to-end business use case, not just workbook structure or file name.
+
+•          Identify opportunities only where there is sufficient evidence from the EUC analysis.
+
+•          Highlight material differences that may prevent consolidation or automation, such as different business rules, data sources, regulatory requirements, manual judgement or entity-specific requirements."""
+
+
+RECONCILIATION_PROMPT = """Review the EUC and identify all reconciliations that are actually performed in the workbook. Provide me the number of reconciliations conducted.
+
+Only classify an activity as a reconciliation where two or more balances, datasets, reports, systems or periods are compared to confirm agreement or identify differences. Do not treat standalone calculations as reconciliations.
+
+For each reconciliation identified, provide:
+
+1. Overview: What is being reconciled against what.
+
+2. Source A: First data source, report, system or worksheet.
+
+3. Source B: Comparison data source, report, system or worksheet.
+
+4. Matching criteria: How the two sources are matched or compared. What is the tolerance level (if any)
+
+5. Exception logic: Any documented rules, explanations, supporting comments, or evidence within the EUC that help explain, classify, or justify identified differences or unreconciled items."""
+
+
 @dataclass
 class Narrative:
     """The narrative fields an assessor fills."""
@@ -33,6 +116,11 @@ class Narrative:
     purpose_of_file: str | None = None
     key_output_outcome: str | None = None
     key_outputs: list | None = None
+    business_use_case: str | None = None
+    process: str | None = None
+    sub_process: str | None = None
+    process_evidence: list[str] = field(default_factory=list)
+    sub_process_evidence: list[str] = field(default_factory=list)
     tabs: dict[str, str] = field(default_factory=dict)  # tab name -> purpose
 
 
@@ -61,6 +149,10 @@ def build_bundle(assessment, wx) -> dict:
 
     tabs = []
     sheet_by_name = {s.name: s for s in wx.sheets}
+    # Keep the filename as context, but never accept it as evidence for a
+    # Process/Sub-process label. Classifications must be supported by workbook
+    # content such as worksheet names and headers.
+    business_evidence = []
     for ta in assessment.tabs:
         name = ta.tab_name.value
         s = sheet_by_name.get(name)
@@ -68,13 +160,16 @@ def build_bundle(assessment, wx) -> dict:
         if s:
             for r in s.regions:
                 headers += [h for h in r.headers if h]
+        business_evidence.extend([name] + headers)
         kc = ta.key_calculation_transformation_logic.value
         tabs.append({
             "name": name,
+            "visibility": ta.tab_visibility.value,
             "category": ta.tab_category.value,
+            "roles": ta.tab_roles.value,
             "information": ta.tab_information_analysis.value,
-            "headers": headers[:20],
-            "top_functions": (kc or {}).get("top_functions", []) if isinstance(kc, dict) else [],
+            "headers": list(dict.fromkeys(headers))[:100],
+            "business_description": (kc or {}).get("business_description") if isinstance(kc, dict) else None,
             "upstream": ta.upstream_dependencies.value,
             "downstream": ta.downstream_dependencies.value.get("in_workbook")
             if isinstance(ta.downstream_dependencies.value, dict) else None,
@@ -83,31 +178,25 @@ def build_bundle(assessment, wx) -> dict:
 
     return {
         "file_name": val(fa.file_name),
+        # This repository has Logic Types and tab-category taxonomies, but no
+        # separate business Process/Sub-process catalogue.
+        "process_subprocess_taxonomy": [],
         "business_area_process": val(fa.business_area_process),
+        "process": val(fa.process),
+        "sub_process": val(fa.sub_process),
         "complexity": val(fa.complexity),
         "logic_type": val(fa.logic_type),
+        "logic_types": val(fa.logic_types),
         "key_calculations": val(fa.key_calculations_logic),
         "key_inputs": val(fa.key_inputs),
+        "reconciliation_candidates": val(fa.reconciliation_logic),
         "sheet_count": len(wx.sheets),
+        "business_evidence": list(dict.fromkeys(x for x in business_evidence if x)),
         "tabs": tabs,
     }
 
 
 # ------------------------------------------------------------- offline assessor
-
-
-def _stem(name: str) -> str:
-    return name.rsplit(".", 1)[0] if "." in name else name
-
-
-_PURPOSE_VERB = {
-    "Calculation": "perform calculations / modelling",
-    "Reconciliation": "reconcile or match figures across sources",
-    "Data Transformation": "transform and reshape source data",
-    "Reporting": "assemble reporting / MI output",
-    "Manual Input": "capture data entered by hand",
-    "Other": "support a business process",
-}
 
 
 class OfflineAssessor:
@@ -120,50 +209,23 @@ class OfflineAssessor:
         logic = bundle.get("logic_type") or "Other"
         cats = [t["category"] for t in bundle["tabs"]]
         cat_counts = ", ".join(sorted({c for c in cats})) or "no classified tabs"
-        outputs = [t["name"] for t in bundle["tabs"] if t["category"] == "Output"]
-        top_fns = (bundle.get("key_calculations") or {}).get("top_functions", []) \
-            if isinstance(bundle.get("key_calculations"), dict) else []
-
-        purpose = (
-            f"'{_stem(bundle['file_name'])}' is a {bundle.get('complexity','').lower()}"
-            f"-complexity {logic.lower()} workbook across {bundle['sheet_count']} tab(s) "
-            f"({cat_counts}). It appears to {_PURPOSE_VERB.get(logic, _PURPOSE_VERB['Other'])}"
-            + (f", using {', '.join(top_fns[:4])}" if top_fns else "")
-            + "."
-        )
-        inputs = bundle.get("key_inputs")
-        if inputs:
-            purpose += f" Inputs: {', '.join(map(str, inputs[:3]))}."
-
-        outcome = (
-            f"Supports {(bundle.get('business_area_process') or logic).lower()}; "
-            + (f"headline output on tab(s) {', '.join(outputs)}."
-               if outputs else "outputs are produced within the calculation tabs.")
-        )
-
-        key_outputs = []
-        for t in bundle["tabs"]:
-            if t["category"] == "Output" or (not outputs and t["information"] == "output"):
-                label = t["name"]
-                if t["headers"]:
-                    label += f" ({', '.join(t['headers'][:5])})"
-                key_outputs.append(label)
-
+        purpose = "Not established — confirm the workbook's business purpose with the process owner."
+        outcome = "Not established — confirm the final business outcome and recipient with the process owner."
         tab_purposes = {}
         for t in bundle["tabs"]:
-            fns = ", ".join(t["top_functions"][:3])
             hdr = ", ".join(t["headers"][:4])
             tab_purposes[t["name"]] = (
                 f"{t['category']} tab ({t['information']})."
                 + (f" Columns: {hdr}." if hdr else "")
-                + (f" Key logic: {fns}." if fns else "")
                 + (" Hidden sheet." if t["hidden"] else "")
             )
 
         return Narrative(
             purpose_of_file=purpose,
             key_output_outcome=outcome,
-            key_outputs=key_outputs or ["no distinct output tab identified"],
+            key_outputs=[],
+            process="Not established — confirm with the process owner",
+            sub_process="Not established — confirm with the process owner",
             tabs=tab_purposes,
         )
 
@@ -181,13 +243,69 @@ _SYSTEM = (
 )
 
 _INSTRUCTION = (
+    PROCESS_SUBPROCESS_PROMPT
+    + "\n\nThe codebase currently has no separate business Process/Sub-process catalogue; its Logic Types and tab categories are different taxonomies and must not be reused as business processes. Reuse a stable broad classification for materially similar activities and do not create a workbook-specific category. Do not use the workbook filename as primary evidence.\n"
     "Return JSON with exactly these keys:\n"
+    '  "business_use_case": string — concise Stage 1 identification from purpose, inputs, logic, controls and outputs.\n'
     '  "purpose_of_file": string — 1-2 sentences on what the workbook is for.\n'
     '  "key_output_outcome": string — the business outcome it supports.\n'
-    '  "key_outputs": array of strings — the main outputs produced.\n'
+    '  "key_outputs": array of strings — final business deliverables only; exclude intermediate workings.\n'
+    '  "process": string — business process, or "Not established — confirm with the process owner".\n'
+    '  "sub_process": string — narrower activity, or the same not-established value.\n'
+    '  "process_evidence": array of exact text snippets copied from the evidence below.\n'
+    '  "sub_process_evidence": array of exact text snippets copied from the evidence below.\n'
     '  "tabs": object mapping each tab name to a one-sentence purpose.\n'
+    "Only classify process/sub-process when specific business terms in the workbook name, "
+    "worksheet names, or headers support it; generic terms such as Input, Output, Calculation, "
+    "Model, Data, and Summary are not sufficient. "
+    "Return exact source snippets in process_evidence and sub_process_evidence. "
+    "Use no formula counts, function names, or formula skeletons as business conclusions. "
+    "List Key Outputs only when a final business deliverable is evidenced; otherwise return [].\n"
     "Evidence:\n"
 )
+
+_RECONCILIATION_RESPONSE = (
+    "Return JSON with exactly these keys: reconciliation_count (integer) and "
+    "reconciliations (array). Each array item must contain worksheet, overview, "
+    "source_a, source_b, matching_criteria, tolerance, exception_logic and "
+    "evidence. Each evidence item must be an object with worksheet and text, "
+    "where text is copied exactly from a supplied worksheet name or header. "
+    "Only state matching criteria, tolerance or exception logic when directly "
+    "supported by the supplied evidence; otherwise say it is not established. "
+    "Use an empty array and count 0 when no genuine comparison is evidenced. "
+    "Do not count standalone calculations, mappings or lookups."
+)
+
+_RATIONALIZATION_RESPONSE = (
+    "Return one JSON object with a results array containing one item for each "
+    "current EUC. Each item must contain comparison_id (copied from current) "
+    "and these fields: "
+    "potential_duplication (object with verdict and matches), "
+    "similar_duplicate_files (array of comparison_id, functional_similarities, "
+    "material_differences and evidence), "
+    "potential_simplification (object with verdict and candidates), "
+    "potential_consolidation (object with verdict and candidates), "
+    "potential_automation (object with verdict and candidates), and "
+    "potential_retirement (object with verdict, retirement_basis, "
+    "replacement_comparison_ids, replacement_coverage and evidence). "
+    "Every match or recommendation must contain an evidence array. Each evidence "
+    "item must be an object with comparison_id, file_id, field and text copied "
+    "exactly from that EUC's supplied purpose, output, input, calculation, control "
+    "or worksheet evidence. "
+    "A duplication match must explain functional similarities and material "
+    "differences and cite evidence from both EUCs. Recommend retirement only "
+    "where evidence supports a duplicated purpose, an explicit statement that it "
+    "is no longer required, or full replacement of its required output. "
+    "Do not report a positive finding or verdict unless it has a retained, "
+    "evidence-backed candidate. For automation, cite explicit evidence of a "
+    "repeatable manual step such as manual entry, paste, override or hardcoding."
+)
+
+
+def _stage_message(prompt: str, response_contract: str, payload: dict) -> str:
+    """Keep approved prompt wording intact, then add the response contract/data."""
+    return (prompt + "\n\n" + response_contract + "\n\nEvidence JSON:\n"
+            + json.dumps(payload, ensure_ascii=False, default=str))
 
 
 class ClaudeAssessor:
@@ -224,8 +342,51 @@ class ClaudeAssessor:
             purpose_of_file=data.get("purpose_of_file"),
             key_output_outcome=data.get("key_output_outcome"),
             key_outputs=data.get("key_outputs"),
+            business_use_case=data.get("business_use_case"),
+            process=data.get("process"),
+            sub_process=data.get("sub_process"),
+            process_evidence=data.get("process_evidence") or [],
+            sub_process_evidence=data.get("sub_process_evidence") or [],
             tabs=data.get("tabs") or {},
         )
+
+    def reconcile(self, bundle: dict) -> dict:
+        """Run the workbook reconciliation prompt as its own analysis stage."""
+        try:
+            import anthropic
+        except ImportError as e:
+            raise RuntimeError(
+                "the Claude assessor needs the 'anthropic' package — "
+                "install it with: uv add --optional llm anthropic"
+            ) from e
+        client = anthropic.Anthropic()
+        msg = client.messages.create(
+            model=self.model,
+            max_tokens=self.max_tokens,
+            system=_SYSTEM,
+            messages=[{"role": "user", "content": _stage_message(
+                RECONCILIATION_PROMPT, _RECONCILIATION_RESPONSE, bundle)}],
+        )
+        return _parse_json("".join(b.text for b in msg.content if b.type == "text"))
+
+    def rationalize(self, payload: dict) -> dict:
+        """Compare the corpus shortlist and assess evidence-backed opportunities."""
+        try:
+            import anthropic
+        except ImportError as e:
+            raise RuntimeError(
+                "the Claude assessor needs the 'anthropic' package — "
+                "install it with: uv add --optional llm anthropic"
+            ) from e
+        client = anthropic.Anthropic()
+        msg = client.messages.create(
+            model=self.model,
+            max_tokens=self.max_tokens,
+            system=_SYSTEM,
+            messages=[{"role": "user", "content": _stage_message(
+                RATIONALIZATION_PROMPT, _RATIONALIZATION_RESPONSE, payload)}],
+        )
+        return _parse_json("".join(b.text for b in msg.content if b.type == "text"))
 
 
 # --------------------------------------------------------- openai / azure assessor
@@ -295,7 +456,28 @@ class OpenAIAssessor:
             purpose_of_file=data.get("purpose_of_file"),
             key_output_outcome=data.get("key_output_outcome"),
             key_outputs=data.get("key_outputs"),
+            business_use_case=data.get("business_use_case"),
+            process=data.get("process"),
+            sub_process=data.get("sub_process"),
+            process_evidence=data.get("process_evidence") or [],
+            sub_process_evidence=data.get("sub_process_evidence") or [],
             tabs=data.get("tabs") or {},
+        )
+
+    def reconcile(self, bundle: dict) -> dict:
+        """Run the workbook reconciliation prompt as its own analysis stage."""
+        return _openai_complete(
+            self.model, self.max_tokens, _SYSTEM,
+            _stage_message(RECONCILIATION_PROMPT, _RECONCILIATION_RESPONSE, bundle),
+            azure_endpoint=self.azure_endpoint, api_version=self.api_version,
+        )
+
+    def rationalize(self, payload: dict) -> dict:
+        """Compare the corpus shortlist and assess evidence-backed opportunities."""
+        return _openai_complete(
+            self.model, self.max_tokens, _SYSTEM,
+            _stage_message(RATIONALIZATION_PROMPT, _RATIONALIZATION_RESPONSE, payload),
+            azure_endpoint=self.azure_endpoint, api_version=self.api_version,
         )
 
 

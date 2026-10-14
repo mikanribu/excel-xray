@@ -21,7 +21,10 @@ def test_extracted_facts(xray):
     fa = assess(xray).file
     assert fa.file_name.value == "messy_reserving_model.xlsx"
     assert fa.file_id.basis == "extracted" and len(fa.file_id.value) == 12
-    assert fa.macros_vba_external_links.value == ["none detected"]
+    macros = fa.macros_vba_external_links.value
+    assert macros["vba"] == {"present": False, "modules": []}
+    assert macros["power_query"] is False
+    assert macros["external_workbook_links"] == 0
 
 
 def test_complexity_is_low_for_small_fixture(xray):
@@ -37,11 +40,12 @@ def test_logic_type_is_calculation(xray):
     assert fa.logic_type.value == "Calculation"
 
 
-def test_manual_intervention_flags_hardcoded_inputs(xray):
+def test_manual_intervention_is_left_for_the_process_owner(xray):
     fa = assess(xray).file
-    assert fa.manual_intervention.value in {"Low", "Medium", "High"}
-    # 66 formulas carry a hardcoded number in this fixture.
-    assert any("hardcoded" in e for e in fa.manual_intervention.evidence)
+    assert fa.manual_intervention.basis == "needs_human"
+    assert fa.manual_intervention.value == (
+        "Not established — confirm which inputs are keyed, pasted, adjusted or overridden, by whom and how often."
+    )
 
 
 def test_deferred_fields_carry_intended_basis(xray):
@@ -57,7 +61,8 @@ def test_deferred_fields_carry_intended_basis(xray):
 def test_key_calculations_extracted(xray):
     fa = assess(xray).file
     assert fa.key_calculations_logic.basis == "extracted"
-    assert fa.key_calculations_logic.value["top_functions"]
+    assert fa.key_calculations_logic.value["business_descriptions"]
+    assert "top_functions" not in fa.key_calculations_logic.value
 
 
 # --------------------------------------------------------------- tab level
@@ -89,13 +94,14 @@ def test_tab_category_valid_or_uncertain(xray):
 def test_assumptions_is_input_feeding_calc(xray):
     t = _tab(xray, "Assumptions")
     assert t.tab_category.value == "Input"
-    assert t.downstream_dependencies.value["in_workbook"] == ["sheet: Calc"]
+    consumers = t.downstream_dependencies.value["in_workbook"]
+    assert consumers == [{"sheet": "Calc", "role": "final output"}]
 
 
 def test_calc_is_calculation_reading_assumptions(xray):
     t = _tab(xray, "Calc")
     assert t.tab_category.value == "Calculation"
-    assert "sheet: Assumptions" in t.upstream_dependencies.value
+    assert "Assumptions" in t.upstream_dependencies.value["in_workbook_sheets"]
 
 
 def test_calc_needs_validation_for_error_and_hardcodes(xray):
@@ -113,36 +119,104 @@ def test_downstream_cross_file_left_to_corpus(xray):
 
 
 def test_simplification_flags_hardcodes_and_hidden_sheet(xray):
+    # One structured candidate per (worksheet, complexity issue) — not one
+    # mixed list of hidden sheets, errors, volatile functions and hardcodes.
     fa = assess(xray).file
     sf = fa.potential_simplification
     assert sf.basis == "derived"
-    assert sf.value["verdict"] == "Yes"
-    ops = " ".join(sf.value["opportunities"])
-    assert "hardcoded" in ops and "hidden" in ops
+    assert "Potential simplification" in sf.value["verdict"]
+    candidates = sf.value["candidates"]
+    assert candidates
+    for c in candidates:
+        assert {"worksheet", "business_activity", "current_complexity",
+                "proposed_change", "expected_benefit", "evidence",
+                "requires_human_confirmation"} <= c.keys()
+    assert any("hardcoded" in c["current_complexity"] for c in candidates)
 
 
 def test_automation_is_a_candidate(xray):
     fa = assess(xray).file
     au = fa.potential_automation
     assert au.basis == "derived"
-    assert au.value["verdict"] in {"Yes", "Possibly"}
-    assert au.value["drivers"]
+    candidates = au.value["candidates"]
+    for c in candidates:
+        assert c["verdict"] == "Potential workflow lead — owner confirmation required"
+        assert c["requires_human_confirmation"] is True
+    assert len(candidates) < 5  # do not turn every worksheet into an automation lead
 
 
-def test_retirement_defers_when_no_signal(xray):
-    # A freshly written fixture with no backup-naming has no retirement signal.
+def test_retirement_never_inferred_from_hidden_or_age(xray):
+    # Retirement is never inferred from hidden sheets, cached errors, file age
+    # or a suggestive filename — always owner-decision, with a targeted ask.
     fa = assess(xray).file
     rt = fa.potential_retirement
-    assert rt.basis in {"derived", "needs_human"}
-    if rt.basis == "needs_human":
-        assert rt.value["verdict"] == "No automated retirement signal"
+    assert rt.basis == "needs_human"
+    assert rt.value["verdict"] == "Not established — confirm with the process owner."
+    assert set(rt.value["confirmation_needed"]) >= {"active usage", "owner"}
 
 
 def test_reconciliation_absent_on_calc_model(xray):
     fa = assess(xray).file
     rl = fa.reconciliation_logic
     assert rl.basis == "derived"
-    assert rl.value == "No reconciliation pattern detected"
+    assert rl.value["reconciliation_count"] == 0
+    assert rl.value["reconciliations"] == []
+
+
+def test_reconciliation_normalizer_counts_three_supported_comparisons():
+    from excel_xray.assessment import _normalise_reconciliation_result
+
+    worksheet = "Reconciliation"
+    pairs = [("Dataset A Balance", "Dataset B Balance"),
+             ("Dataset C Balance", "Dataset D Balance"),
+             ("Dataset E Balance", "Dataset F Balance")]
+    headers = [name for pair in pairs for name in pair] + [
+        "Account ID", "Variance", "Tolerance 0.01%", "Exception comments",
+    ]
+    bundle = {"tabs": [{"name": worksheet, "headers": headers}],
+              "reconciliation_candidates": {"reconciliations": []}}
+    findings = []
+    for source_a, source_b in pairs:
+        findings.append({
+            "worksheet": worksheet,
+            "overview": "model supplied overview is normalized to cited sources",
+            "source_a": source_a,
+            "source_b": source_b,
+            "matching_criteria": "Account ID",
+            "tolerance": "Tolerance 0.01%",
+            "exception_logic": "Exception comments",
+            "evidence": [{"worksheet": worksheet, "text": text}
+                         for text in (source_a, source_b, "Variance", "Account ID",
+                                      "Tolerance 0.01%", "Exception comments")],
+        })
+
+    single = _normalise_reconciliation_result(
+        {"reconciliation_count": 1, "reconciliations": findings[:1]}, bundle)
+    assert single["reconciliation_count"] == 1
+    assert single["reconciliations"][0]["source_a"] == pairs[0][0]
+    assert single["reconciliations"][0]["source_b"] == pairs[0][1]
+    result = _normalise_reconciliation_result(
+        {"reconciliation_count": 3, "reconciliations": findings}, bundle)
+    assert result["reconciliation_count"] == 3
+    assert len(result["reconciliations"]) == 3
+    for item in result["reconciliations"]:
+        assert item["overview"] == f"Compare {item['source_a']} against {item['source_b']}"
+        assert item["matching_criteria"] == "Account ID"
+        assert item["tolerance"] == "Tolerance 0.01%"
+        assert item["exception_logic"] == "Exception comments"
+
+
+def test_reconciliation_details_count_three_independent_regions():
+    from types import SimpleNamespace
+    from excel_xray.review_rules import reconciliation_details
+
+    regions = [SimpleNamespace(headers=[source_a, source_b, "Account ID", "Variance"])
+               for source_a, source_b in (("Source GL", "Target Subledger"),
+                                          ("Dataset A", "Dataset B"),
+                                          ("System A", "System B"))]
+    sheet = SimpleNamespace(name="Reconciliation", regions=regions,
+                            formula_profile={"top_functions": []})
+    assert len(reconciliation_details(sheet)) == 3
 
 
 def test_corpus_findings_still_deferred(xray):
@@ -163,18 +237,26 @@ def test_months_since_helper():
 
 
 def test_business_area_derived_from_logic(xray):
+    # A workbook can support more than one process — logic_types is the primary
+    # driver and every detected activity is joined into the business area.
     fa = assess(xray).file
     assert fa.business_area_process.basis == "derived"
-    assert fa.business_area_process.value == "Calculation / modelling"
+    assert "Calculation / modelling" in fa.business_area_process.value
+    assert "Calculation" in fa.logic_types.value
+    from excel_xray.tabular import FILE_FIELDS
+    assert dict((attr, label) for _, attr, label in FILE_FIELDS)["business_area_process"] == "Business Area Purpose"
 
 
 def test_offline_narrative_is_drafted_and_grounded(xray):
     # Default assessor is the offline stub — no network, basis "drafted".
     fa = assess(xray).file
     assert fa.purpose_of_file.basis == "drafted"
-    assert fa.purpose_of_file.value and "calculation" in fa.purpose_of_file.value.lower()
-    assert fa.key_outputs.basis == "drafted"
-    assert isinstance(fa.key_outputs.value, list) and fa.key_outputs.value
+    assert fa.purpose_of_file.value.startswith("Not established — confirm")
+    # key_outputs is deterministic (Step 12): final deliverables vs supporting/
+    # intermediate/input/mapping tabs, not narrative-supplied.
+    assert fa.key_outputs.basis == "derived"
+    assert isinstance(fa.key_outputs.value, dict)
+    assert "final_business_deliverables" in fa.key_outputs.value
 
 
 def test_every_tab_gets_a_purpose(xray):
@@ -205,6 +287,25 @@ def test_custom_assessor_marks_fields_inferred(xray):
     assert all(t.tab_purpose_description.basis == "inferred" for t in a.tabs)
 
 
+def test_failed_llm_narrative_keeps_deterministic_assessment_and_marks_fallback(xray):
+    class UnavailableLLM:
+        basis = "inferred"
+        label = "test model"
+
+        def narrate(self, bundle):
+            raise ConnectionError("request failed with api_key=do-not-export")
+
+    a = assess(xray, assessor=UnavailableLLM())
+    assert a.scan["assessment_status"] == "partial — offline fallback"
+    assert "ConnectionError" in a.scan["assessment_error"]
+    assert "do-not-export" not in a.scan["assessment_error"]
+    assert a.tabs
+    assert a.file.purpose_of_file.value.startswith("Not established")
+    assert a.file.key_output_outcome.value.startswith("Not established")
+    assert all(t.tab_purpose_description.value for t in a.tabs)
+    assert all(t.tab_purpose_description.basis == "drafted" for t in a.tabs)
+
+
 def test_parse_json_tolerates_fenced_output():
     from excel_xray.narrative import _parse_json
     assert _parse_json('```json\n{"a": 1}\n```') == {"a": 1}
@@ -219,3 +320,66 @@ def test_bundle_carries_no_cell_values(xray):
     blob = json.dumps(bundle)
     # A distinctive cached figure from Calc!C5 must not appear.
     assert "59937" not in blob
+
+
+def test_process_classification_requires_specific_matching_evidence(xray):
+    from excel_xray.narrative import Narrative
+
+    class Unsupported:
+        basis = "inferred"
+        label = "fake model"
+        def narrate(self, bundle):
+            return Narrative(process="Claims", sub_process="Claim payment",
+                            process_evidence=["Calculation"],
+                            sub_process_evidence=["Input"])
+
+    a = assess(xray, assessor=Unsupported())
+    assert a.file.process.basis == "needs_human"
+    assert a.file.sub_process.basis == "needs_human"
+    assert a.file.process.value.startswith("Not established")
+
+
+def test_process_and_subprocess_are_separate_evidence_supported_fields(xray):
+    from excel_xray.narrative import Narrative
+
+    class Supported:
+        basis = "inferred"
+        label = "fake model"
+
+        def narrate(self, bundle):
+            assert bundle["process_subprocess_taxonomy"] == []
+            return Narrative(
+                business_use_case="Monthly claims reserve movement and reporting",
+                process="Claims Management",
+                sub_process="Monthly Reserve Movement",
+                process_evidence=["Policy ID"],
+                sub_process_evidence=["Written Premium"],
+            )
+
+    a = assess(xray, assessor=Supported())
+    assert a.file.process.value == "Claims Management"
+    assert a.file.sub_process.value == "Monthly Reserve Movement"
+    assert a.file.process.value != a.file.sub_process.value
+    assert a.file.process.basis == a.file.sub_process.basis == "inferred"
+
+
+def test_scan_metadata_and_logic_taxonomy_export_once(xray):
+    from excel_xray.assessment import to_dict
+    from excel_xray.tabular import FILE_FIELDS
+
+    a = assess(xray)
+    exported = to_dict(a)
+    assert exported["scan"]["status"] in {"full", "partial"}
+    assert exported["scan"]["total_sheets"] == len(xray.sheets)
+    assert "logic_type" not in exported["file"]
+    serialized = json.dumps(exported)
+    assert "source_path" not in serialized
+    assert "full_path_evidence" not in serialized
+    assert "sha256" not in serialized
+    labels = [label for _, _, label in FILE_FIELDS]
+    assert labels.count("Logic Types") == 1
+    assert "Logic Type" not in labels
+    assert set(a.file.logic_types.value) <= {
+        "Calculation", "Reporting", "Data Transformation",
+        "Reconciliation / Control", "Manual Input", "Other",
+    }

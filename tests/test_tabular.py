@@ -22,7 +22,8 @@ def test_fmt_value_handles_shapes():
     assert fmt_value(["a", "b"]) == "a; b"
     assert fmt_value({"verdict": "Yes", "matches": [{"file": "x.xlsx"}]}) == \
         "Yes — matches: x.xlsx"
-    assert "SUM" in fmt_value({"top_functions": ["SUM×3"], "top_formula_shapes": []})
+    assert fmt_value({"business_descriptions": ["Adds balances into totals"]}) == \
+        "Adds balances into totals"
 
 
 def test_file_rows_cover_the_whole_schema(xray):
@@ -46,7 +47,8 @@ def test_csv_export_roundtrips(xray, tmp_path):
         rows = list(csv.DictReader(fh))
     assert rows[0].keys() >= {"File", "Level", "Type", "Field", "Value", "Basis"}
     # File-level plus every tab's fields are present.
-    assert any(r["Field"] == "Logic Type" and r["Level"] == "File" for r in rows)
+    assert any(r["Field"] == "Logic Types" and r["Level"] == "File" for r in rows)
+    assert not any(r["Field"] == "Logic Type" for r in rows)
     assert any(r["Level"].startswith("Tab:") for r in rows)
 
 
@@ -55,6 +57,9 @@ def test_report_embeds_assessment(xray):
     assert "EUC assessment" in html
     assert "File level summary" in html
     assert "Tab level details" in html
+    assert xray.path not in html
+    assert "Content hash" not in html
+    assert "bytes · modified" not in html
 
 
 def test_report_without_assessment_still_renders(xray):

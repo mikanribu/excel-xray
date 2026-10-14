@@ -54,3 +54,16 @@ def range_boundaries(ref: str) -> tuple[int, int, int, int]:
     c2 = column_index_from_string(me.group(1))
     r2 = int(me.group(2))
     return (min(c1, c2), min(r1, r2), max(c1, c2), max(r1, r2))
+
+
+def safe_scan_message(message: object, source_path: str | None = None) -> str:
+    """Keep a concise diagnostic while removing local paths and credentials."""
+    import os
+
+    text = str(message or "")
+    if source_path:
+        text = text.replace(str(source_path), os.path.basename(source_path))
+    text = re.sub(r"(?i)(?:[a-z]:\\|/Users/|/home/|/private/)[^\s:'\"]+", "[source path]", text)
+    text = re.sub(r"(?i)(password|pwd|uid|user id|token|api[_-]?key|access[_-]?key|secret)=([^;\s]+)",
+                  r"\1=[redacted]", text)
+    return text[:240]
