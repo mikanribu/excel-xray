@@ -45,6 +45,8 @@ class Field:
     basis: Basis = "needs_human"
     confidence: float | None = None
     evidence: list[str] = field(default_factory=list)
+    evidence_refs: list[str] = field(default_factory=list)
+    confidence_kind: str | None = None  # heuristic scores are not calibrated probabilities
 
     @classmethod
     def extracted(cls, value, evidence=None) -> "Field":
@@ -54,7 +56,7 @@ class Field:
     @classmethod
     def derived(cls, value, confidence, evidence) -> "Field":
         return cls(value=value, basis="derived", confidence=round(confidence, 2),
-                   evidence=list(evidence))
+                   evidence=list(evidence), confidence_kind="heuristic")
 
     @classmethod
     def pending(cls, basis: Basis, note: str = "") -> "Field":
@@ -958,6 +960,8 @@ def assess_tab(s, wx, reads_set, read_by_set, category: Field, roles: Field,
          f"as evidence even though visible tabs are presented first)"],
     )
     ta.tab_category = category
+    ta.tab_category.confidence_kind = "heuristic"
+    ta.tab_category.evidence_refs = [f"{s.name}!{r.ref}" for r in s.regions if r.kind != "unknown"][:12]
     ta.tab_roles = roles
     ta.tab_information_analysis = _tab_information(s, roles.value or [], has_up, has_down)
     ta.key_calculation_transformation_logic = _tab_key_calc(s, tab_index.get(s.name))
