@@ -36,7 +36,7 @@ _FUNC = re.compile(r"\b([A-Z][A-Z0-9_.]*)\s*\(")
 # sheet prefix (optional) + A1 reference. Handles 'quoted sheet'!, [1]External!,
 # and bare Sheet1!. Column letters capped at 3 (XFD is the Excel maximum).
 _REF = re.compile(
-    r"(?P<ext>\[\d+\])?"
+    r"(?<![A-Za-z0-9_.])(?P<ext>\[\d+\])?"
     r"(?P<sheet>'(?:[^']|'')+'|[A-Za-z_][A-Za-z0-9_.]*)?"
     r"(?P<bang>!)?"
     r"(?P<cabs>\$)?(?P<col>[A-Za-z]{1,3})(?P<rabs>\$)?(?P<row>\d{1,7})"
@@ -112,7 +112,7 @@ def analyse(formula: str, row: int, col: int) -> FormulaFacts:
     facts.is_volatile = any(fn in VOLATILE for fn in facts.functions)
 
     # Track pending range starts so B5:B8 records as one span, not two cells.
-    pending: dict[int, tuple[int, int]] = {}
+    pending: list[tuple[int, int, int, int]] = []  # start, end, row, col
     rewritten: list[str] = []
 
     def ref_repl(m: re.Match) -> str:
@@ -125,6 +125,10 @@ def analyse(formula: str, row: int, col: int) -> FormulaFacts:
             sheet = None
         c = col_to_num(m.group("col"))
         r = int(m.group("row"))
+        # Excel A1 references cannot extend beyond XFD1048576. Reject
+        # identifier-like false matches (e.g. LOG2025) without consuming them.
+        if c > 16384 or r < 1 or r > 1048576:
+            return m.group(0)
         cabs, rabs = bool(m.group("cabs")), bool(m.group("rabs"))
 
         if ext:
@@ -137,7 +141,7 @@ def analyse(formula: str, row: int, col: int) -> FormulaFacts:
         else:
             facts.local_refs += 1
             scope = ""
-            pending[m.start()] = (r, c)
+            pending.append((m.start(), m.end(), r, c))
 
         rpart = f"R{r}" if rabs else (f"R[{r-row}]" if r != row else "R")
         cpart = f"C{c}" if cabs else (f"C[{c-col}]" if c != col else "C")
@@ -146,27 +150,23 @@ def analyse(formula: str, row: int, col: int) -> FormulaFacts:
 
     skel = _REF.sub(ref_repl, masked)
 
-    # Resolve local precedents, merging A:B into spans where a colon joins them.
-    positions = sorted(pending)
-    used: set[int] = set()
-    for i, p in enumerate(positions):
-        if p in used:
-            continue
-        if i + 1 < len(positions):
-            q = positions[i + 1]
-            between = masked[p:q]
-            if ":" in between and between.count(":") == 1:
-                r1, c1 = pending[p]
-                r2, c2 = pending[q]
+    # Only adjacent A1 tokens joined by an actual colon form a range.
+    # Looking for a colon anywhere between starts incorrectly connects
+    # unrelated references such as SUM(A1:B2)+C3.
+    i = 0
+    while i < len(pending):
+        start, stop, r1, c1 = pending[i]
+        if i + 1 < len(pending):
+            next_start, _, r2, c2 = pending[i + 1]
+            if masked[stop:next_start].strip() == ":":
                 facts.precedent_cells.extend(
                     _expand_range_cells(min(r1, r2), min(c1, c2),
                                         max(r1, r2), max(c1, c2))
                 )
-                used.add(p)
-                used.add(q)
+                i += 2
                 continue
-        facts.precedent_cells.append(pending[p])
-        used.add(p)
+        facts.precedent_cells.append((r1, c1))
+        i += 1
 
     # Order matters: refs are sentinels at this point, so the only digits left
     # are genuine literals. A hardcoded number inside a formula is exactly what
