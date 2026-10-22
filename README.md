@@ -18,10 +18,10 @@ or Windows. These commands are for a macOS/Linux terminal; on Windows, run the
 equivalent commands in PowerShell and use the printed run-folder path in step 4.
 No API key or model service is needed for the default offline assessment.
 
-1. Get **this branch** and install its dependencies:
+1. Clone **`main`** and install its dependencies:
 
    ```bash
-   git clone --branch codex/portfolio-dashboard-exports https://github.com/mikanribu/excel-xray.git
+   git clone https://github.com/mikanribu/excel-xray.git
    cd excel-xray
    uv sync
    ```
@@ -196,14 +196,17 @@ the file versus what still needs a model, a human, or the wider corpus:
 | Basis | Meaning |
 |---|---|
 | `extracted` | read directly from the file |
-| `derived` | a heuristic over extracted metrics (with evidence) |
+| `derived` | a heuristic over extracted metrics (with evidence); its confidence score is not a calibrated probability |
 | `drafted` | offline narrative template from the evidence |
 | `inferred` | written by the LLM assessor (`--llm`) |
 | `needs_human` | not knowable from the file (e.g. usage frequency) |
 | `needs_corpus` | needs the whole folder (only when scanning one file) |
 
-Nothing is fabricated: a `drafted` value is never presented as a considered one,
-and fields that genuinely aren't in the file stay `needs_human`.
+Drafted narratives remain distinguishable from model-inferred statements, and
+fields requiring business knowledge stay `needs_human`. Derived assessments
+include `confidence_kind: "heuristic"`; tab-category results also provide
+`evidence_refs` (e.g. `Calc!A3:G13`) identifying regions that support the
+classification. These locations are not proof of business interpretation.
 
 ## Why not openpyxl
 
@@ -243,14 +246,11 @@ Layers, deliberately separated.
 | [ooxml.py](src/excel_xray/ooxml.py) | Structure straight from the zip via `lxml`: merges, ListObjects, connections, external links, pivot caches, VBA, Power Query |
 | [sheetmodel.py](src/excel_xray/sheetmodel.py) | Single `lxml` pass over `<sheetData>` → cells (value + formula + style) and a formula profile. Resolves `sharedStrings` and `styles` |
 | [regions.py](src/excel_xray/regions.py) | Occupancy runs → connected components → header inference → classification. Detects hand-built table regions nothing off-the-shelf finds |
-| [formulas.py](src/excel_xray/formulas.py) | A1 → R1C1 → literal abstraction. Collapses a filled-down column to one skeleton |
+| [formulas.py](src/excel_xray/formulas.py) | A1 → R1C1 → literal abstraction; hardened invalid A1 coordinate handling and local range-precedent grouping. Remains regex-based rather than a complete Excel formula parser |
 | [scan.py](src/excel_xray/scan.py) | Triage, orchestration, occupancy plate |
 | [assessment.py](src/excel_xray/assessment.py) | Evidence → EUC schema: complexity, controlled logic types, tab categories, dependencies, human-validation, heuristic findings |
 | [narrative.py](src/excel_xray/narrative.py) | Narrative fields behind an `Assessor` interface: offline template (default) or Claude (`--llm`) |
 | [corpus.py](src/excel_xray/corpus.py) | Per-file duplication/consolidation fields (formula shapes + headers) |
-| [portfolio.py](src/excel_xray/portfolio.py) | One-at-a-time folder scan, SQLite store, cross-EUC findings, consolidated CSV/Excel and selected bundles |
-| [portfolio_web.py](src/excel_xray/portfolio_web.py) | Local dashboard, drill-down, comparison and download routes |
-| [xlsx_report.py](src/excel_xray/xlsx_report.py) | Existing individual and estate Excel reports |
 | [estate.py](src/excel_xray/estate.py) | Estate comparison: four-signal fingerprints, relationship typing, clustering |
 | [estate_insight.py](src/excel_xray/estate_insight.py) | Interprets families → recommendations (offline template or Claude) |
 | [estate_report.py](src/excel_xray/estate_report.py) | Standalone estate HTML + pairs CSV |
@@ -387,10 +387,12 @@ for i, j, c in estate.pairs:
 
 ### Privacy
 
-The report, JSON and CSV contain cell **coordinates, types, normalised formula
-shapes, headers and derived assessments** — **no cell values**. An X-ray can be
-circulated to people who are not cleared for the underlying figures, and the
-`--llm` bundle carries no values either.
+Structural reports and assessment exports exclude raw cell values, but names,
+headers, formulas, metadata, and assessment language may still be sensitive.
+Only share reports with authorized reviewers. The LLM evidence bundle also
+excludes cell values but can contain sensitive structural text. Downloads of
+original EUCs and the originals + analysis ZIP contain **complete source files,
+including their cell values**.
 
 ## Measured accuracy
 
@@ -409,6 +411,20 @@ is wrong only where it says it is unsure, which the test suite enforces. This is
 one workbook written to exercise known failure modes; do not quote it as corpus
 accuracy.
 
+## Testing and P0 hardening
+
+A [GitHub Actions workflow](.github/workflows/tests.yml) runs the full pytest
+suite on pull requests to `main` and on pushes to `main`.
+
+```bash
+uv run --group dev pytest -q
+```
+
+The [P0 regression tests](tests/test_p0_hardening.py) cover range precedents,
+invalid coordinates and provenance fields. Formula analysis is still regex-based,
+not a complete Excel grammar parser. Confidence scores are heuristic, not
+empirically calibrated; wider real-world benchmarking remains future work.
+
 ## Setup
 
 ```bash
@@ -422,5 +438,8 @@ uv sync --extra llm          # + anthropic, openai, python-dotenv, for --llm
 - Reads `.xlsx` / `.xlsm`. Legacy `.xls` is triaged and reported, not parsed.
 - Three fields are genuinely not in the file and stay `needs_human`: Usage
   Frequency, Completion Timeline, Output Recipient. A reviewer supplies these.
-- The heuristic findings and tab categories carry a confidence and evidence;
-  treat anything the tool flags `Uncertain` or below `0.70` as a prompt to look.
+- Heuristic findings and tab categories have confidence-like scores and evidence,
+  but their scores are **not calibrated probabilities**; review `Uncertain`
+  classifications and results below `0.70`.
+- The separate Claude landscape branch was not integrated into `main`; its
+  Keep/Consolidate/Remove suggestions are not part of the default workflow.
